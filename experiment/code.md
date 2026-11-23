@@ -7,6 +7,38 @@ built and tested. Design rationale lives in [vllm.md](vllm.md) and
 
 ---
 
+## 0. Implementation status (updated 2026-11-23)
+
+P1–P6 are implemented and verified on a **real T4 GPU** with the real 102.5M
+GPT, the real 86M BiomedCLIP tower, and the released SFT checkpoint. Run
+`python -m code_test.test_all` — all checks pass.
+
+**Key discovery during implementation:** the released SFT checkpoint
+`sddfhy546y/minillm:sft_model.pt` reports `context_length = 128` in its
+`model_config` (its `pos_emb.weight` has 128 rows), not the 1024 in the
+generic `configs/model.yaml`. The wrapper therefore derives `llm_cfg` from
+the checkpoint, not from the YAML, and the working geometry is:
+
+| Quantity | Planned | Actual (checkpoint-bound) |
+| --- | --- | ---: |
+| GPT context | 1024 | **128** |
+| Visual tokens K | 64 | **16** |
+| Text budget | 960 | **112** |
+| GPT params | 102.5M | 102.47M |
+| Connector params (K=16, depth=2) | 14.82M | **14.78M** |
+
+The connector is almost independent of K (the 64→16 query tensor is only
+49K→12K params out of ~14.8M); K=64 remains 14.82M as designed. If a
+longer-context decoder checkpoint becomes available, only `llm_cfg` and
+`num_visual_tokens` need changing — no code changes.
+
+Datasets verified on Kaggle: ROCOv2, PMC-VQA (`mdwiratathya/PMC-VQA_small`),
+PathVQA, SLAKE (`mdwiratathya/SLAKE-vqa-english`), VQA-RAD, Dolly (replay).
+The SLAKE id in the original plan had a typo (`BoKelwen` → `BoKelvin`); both
+the corrected id and an image-bearing mirror are now in `data/medical_vqa.py`.
+
+---
+
 ## 1. Guiding principles
 
 1. **Bottom-up, testable at every layer.** The connector and wrapper are

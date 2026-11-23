@@ -4,6 +4,6 @@ encoder_backend: open_clip          # or "hf" for openai/clip-vit-base-patch32
 image_size: 224
 freeze_encoder: true
 connector: perceiver                # perceiver | pooled_mlp
-num_visual_tokens: 64
+num_visual_tokens: 16
 resampler_depth: 2
 output_gate_init: 0.1

@@ -1,7 +1,7 @@
 # configs/model.yaml
 
 vocab_size: 50257        # Vocabulary size
-context_length: 1024     # Context length (long enough for compact tool prompts)
+context_length: 128      # MUST match the released SFT checkpoint (pos_emb has 128 rows)
 emb_dim: 768             # Embedding dimension
 n_heads: 12              # Number of attention heads (head_dim = 64)
 n_layers: 9              # Number of layers

@@ -1,16 +1,16 @@
 # configs/vqa_sft.yaml — Stage 2: medical VQA instruction tuning (connector + LLM)
-init_from: checkpoints/align/medicalvllm_align.pt
+init_from: /kaggle/temp/medicalvllm/align/medicalvllm_align_final.pt
 data:
   mix: {pmc_vqa: 0.55, path_vqa: 0.20, slake: 0.10, vqa_rad: 0.05, text_replay: 0.10}
-  max_seq_budget: 960          # context_length 1024 - K 64
+  max_seq_budget: 112          # context_length 128 - K 16
   shuffle_buffer: 1000
 freeze_llm: false
 lora: {enabled: false, r: 16, alpha: 32}
 lr_llm: 1.0e-5
 lr_connector: 5.0e-5
 warmup_steps: 100
-batch_size: 16
-grad_accum_steps: 4
+batch_size: 8
+grad_accum_steps: 2
 epochs: 2
 hours: 8
 grad_clip: 1.0

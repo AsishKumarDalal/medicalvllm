@@ -2,11 +2,13 @@
 llm_checkpoint: ../minillm/sft_checkpoints/sft_model.pt   # normal SFT, NOT tool-calling
 hf_fallback: {repo: sddfhy546y/minillm, filename: sft_model.pt}
 data:
-  dataset: eltorio/ROCOv2-radiology   # verify id at P0; fallbacks in data/captions.py
+  dataset: eltorio/ROCOv2-radiology   # verified: image, image_id, caption, cui
   radiology_only: true
   shuffle_buffer: 500
+  max_text_tokens: 112
+  max_image_size: 512
 freeze_llm: true
-batch_size: 32
+batch_size: 16
 grad_accum_steps: 2
 learning_rate: 1.0e-4
 warmup_steps: 200
@@ -14,6 +16,6 @@ epochs: 2
 hours: 4
 grad_clip: 1.0
 checkpoint_interval_minutes: 60
-checkpoint_dir: checkpoints/align
-out_dir: outs/align
+checkpoint_dir: /kaggle/temp/medicalvllm/align
+out_dir: /kaggle/temp/medicalvllm/outs/align
 hf: {enabled: false}
