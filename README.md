@@ -46,6 +46,38 @@ The SFT checkpoint is resolved from `configs/align.yaml`: local path first,
 then `hf_fallback` (`sddfhy546y/minillm:sft_model.pt`). The 86M vision tower is
 never saved in checkpoints — it is rebuilt from its name at load time.
 
+## Reading guide — start here
+
+Hold one sentence in your head: **the vision tower writes 196 sticky notes,
+the connector rewrites them as 16 summary cards, and the GPT reads those cards
+plus your question.**
+
+Read these five files in order (~20 min):
+
+| # | File | What to look at |
+| --- | --- | --- |
+| 1 | `experiment/connector.md` §0–2 | the picture, before any code |
+| 2 | `model/vision_encoder.py` | `VisionTower.forward` (line 83) — pixels → 196×768 |
+| 3 | `model/connector.py` | `PerceiverResampler.forward` (line 59) — 196 → 16 |
+| 4 | `model/minillm/model.py` | `forward` (118) vs `forward_embeds` (127) — the ONE decoder change |
+| 5 | `model/medical_vllm.py` | `forward` (62) and `generate` (88) — how the three pieces join |
+
+Then follow one image end-to-end:
+
+```
+data/transforms.py  →  model/vision_encoder.py:83  →  model/connector.py:59
+                   →  model/medical_vllm.py:50 (encode_image)
+                   →  model/medical_vllm.py:62 (cat + labels -100)
+                   →  model/minillm/model.py:127 (forward_embeds)
+```
+
+To *see* it run rather than just read it:
+
+```bash
+python -m code_test.test_all      # 20 assertions, prints [PASS] for each stage
+python -m train.align --steps 2   # watch a real training step happen
+```
+
 ## Layout
 
 | Path | Purpose |
