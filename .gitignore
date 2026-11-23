@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+checkpoints/
+outs/
+logs/
+*.pt
+*.pid
+data_cache/
+.ipynb_checkpoints/

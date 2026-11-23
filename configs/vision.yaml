@@ -1,0 +1,9 @@
+# configs/vision.yaml — encoder + connector (see experiment/vllm.md §2)
+encoder: microsoft/BiomedCLIP-PubMedBERT_256-vit_base_patch16_224
+encoder_backend: open_clip          # or "hf" for openai/clip-vit-base-patch32
+image_size: 224
+freeze_encoder: true
+connector: perceiver                # perceiver | pooled_mlp
+num_visual_tokens: 64
+resampler_depth: 2
+output_gate_init: 0.1
