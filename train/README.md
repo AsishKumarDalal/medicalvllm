@@ -193,6 +193,10 @@ the active mode: `phase2`, `phase2 (time budget)` or `phase2 (rows)`. On resume,
 the starting percentage comes from the saved `step`, `elapsed_seconds` or
 `examples_seen`, so it never resets to 0.
 
+Right after the green bar, `{n_fmt}/{total_fmt}` always shows the **target**:
+`1850/1850` steps, `600/28800` seconds, or `58900/200000` rows. So you can see
+both progress and the goal at a glance.
+
 Full INFO lines print for the first 10 steps and every 100 after; the bar is
 the live display. Tune with `log_first_steps` and `log_interval` in the config.
 Log lines are written *above* the bar via `tqdm.write`. Per-request library

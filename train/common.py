@@ -579,18 +579,19 @@ def build_progress_bar(
         return None
 
     if max_steps:
-        mode, total, initial = "steps", float(max_steps), float(state.step)
+        mode, total = "steps", int(max_steps)
+        initial = min(total, int(state.step))       # int → clean "n/total"
         unit, desc = "step", f"phase{phase}"
     elif max_hours:
         mode = "hours"
-        total = float(max_hours) * 3600.0
-        initial = min(total, max(0.0, state.elapsed_seconds))
+        total = int(float(max_hours) * 3600.0)
+        initial = min(total, int(max(0.0, state.elapsed_seconds)))
         unit, desc = "s", f"phase{phase} (time budget)"
     else:
         mode = "rows"
-        total = float(epoch_size) if epoch_size and epoch_size > 0 else None
+        total = int(epoch_size) if epoch_size and epoch_size > 0 else None
         # Wrap at one dataset pass so the bar fills once per epoch.
-        initial = float(state.examples_seen % epoch_size) if total else 0.0
+        initial = int(state.examples_seen % epoch_size) if total else 0
         unit, desc = "row", f"phase{phase} (rows)"
 
     pbar = tqdm(
@@ -600,13 +601,15 @@ def build_progress_bar(
         unit=unit,
         # Fixed width: dynamic_ncols in a Kaggle output cell is detected as a
         # tiny terminal, which clips the right-hand stats.
-        ncols=150,
+        ncols=170,
         # Seed the postfix at creation so the first render already has the
         # final width — otherwise tqdm draws a full-width empty bar first
         # and a narrow bar after the first step ("inconsistent" bar).
         postfix=postfix(state, 0.0, 0.0),
         colour="green",
-        bar_format="{desc}: {percentage:3.0f}%|{bar}|{postfix}",
+        # {n_fmt}/{total_fmt} always shows the TARGET: steps / steps,
+        # seconds / seconds (time budget), or rows / epoch_size.
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} |{postfix}",
     )
     pbar._mv_mode = mode
     pbar._mv_epoch_size = int(epoch_size)
@@ -625,7 +628,7 @@ def progress_update(
         return
     mode = getattr(pbar, "_mv_mode", "steps")
     if mode == "hours":
-        pbar.update(max(0.0, elapsed_seconds))
+        pbar.update(max(0, int(elapsed_seconds)))
     elif mode == "rows":
         epoch_size = getattr(pbar, "_mv_epoch_size", 0)
         target = int(examples_seen % epoch_size) if epoch_size else int(n_rows)
