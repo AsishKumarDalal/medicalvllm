@@ -9,6 +9,11 @@ See [vllm.md](vllm.md) for the full project plan.
 - **Trainable params:** **14.82M** (2 resampler blocks, 4× FFN)
 - **Trained in:** Stage 1 (LLM frozen) and Stage 2 (LLM unfrozen); tower always frozen
 
+![Connector architecture](connector_architecture.png)
+
+*Editable source: [`make_connector_diagram.py`](make_connector_diagram.py) —
+rerun `python experiment/make_connector_diagram.py` after design changes.*
+
 ---
 
 ## 1. Where the connector sits
