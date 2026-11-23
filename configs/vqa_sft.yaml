@@ -15,6 +15,10 @@ grad_accum_steps: 2
 epochs: 2
 hours: 8
 grad_clip: 1.0
+sample_interval: 500          # every N steps: show 1 VQA-RAD image + generation
+sample_max_new_tokens: 32
+sample_temperature: 0.0
+sample_top_k: null
 eval: {every_steps: 1000, dev_samples: 200}
 checkpoint_interval_minutes: 60
 checkpoint_dir: checkpoints/vqa

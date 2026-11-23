@@ -31,8 +31,21 @@ class CaptionStream:
         self.encoder = get_encoder()
         self.prompt_ids = None  # lazy: set after first encode
         self.stats = {"seen": 0, "kept": 0, "dropped": 0, "bad_image": 0}
+        self._active_gen = None
 
     def __iter__(self) -> Iterator[dict]:
+        # Keep a handle so close() can release the underlying streaming
+        # dataset BEFORE interpreter shutdown (otherwise pending HTTP range
+        # requests throw "Bad file descriptor" and retry loops hang the exit).
+        self._active_gen = self._generate()
+        return self._active_gen
+
+    def close(self):
+        if self._active_gen is not None:
+            self._active_gen.close()
+            self._active_gen = None
+
+    def _generate(self) -> Iterator[dict]:
         from datasets import load_dataset
 
         ds = load_dataset(self.dataset, split="train", streaming=True)

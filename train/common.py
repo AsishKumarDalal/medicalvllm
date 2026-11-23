@@ -19,6 +19,11 @@ import numpy as np
 import torch
 import yaml
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -296,6 +301,53 @@ def build_checkpoint(
     }
 
 
+def shutdown_streaming_http():
+    """Gracefully stop fsspec's background IO loop.
+
+    ``datasets`` streaming downloads parquet shards through an fsspec
+    aiohttp session that lives on a *daemon* thread (``fsspecIO``). If Python
+    starts shutting down while a range request is in flight, the socket is
+    closed under it and huggingface_hub's retry loop spams "Bad file
+    descriptor" for ~30 s. Cancelling pending tasks and stopping the loop
+    first removes the race entirely.
+    """
+    try:
+        import asyncio
+        import fsspec.asyn as asyn
+
+        loop = asyn.loop[0]
+        thread = asyn.iothread[0]
+        if loop is None:
+            return
+
+        async def _cancel_pending():
+            tasks = [
+                t for t in asyncio.all_tasks()
+                if t is not asyncio.current_task()
+            ]
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+        fut = asyncio.run_coroutine_threadsafe(_cancel_pending(), loop)
+        fut.result(timeout=10)
+        loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5)
+        asyn.loop[0] = None
+        asyn.iothread[0] = None
+    except Exception as exc:
+        logger.debug("streaming HTTP shutdown: %s", exc)
+
+    # Even after the loop stops, huggingface_hub may still have a range
+    # request in flight on a httpx connection. If interpreter teardown closes
+    # that socket first, its retry loop fires "Bad file descriptor" and hangs
+    # exit for ~30 s. A short drain lets those requests finish. Verified with
+    # 5/5 clean exits on a minimal datasets-only reproducer.
+    time.sleep(2.0)
+
+
 def latest_local_checkpoint(directory: str | Path, patterns: tuple[str, ...]):
     """Most recently modified file matching any pattern, or ``None``."""
     directory = Path(directory)
@@ -358,3 +410,253 @@ def save_plots(out_dir: str | Path):
     except Exception as exc:
         logger.warning("could not write plots (%s): %s",
                        type(exc).__name__, exc)
+
+
+# ---------------------------------------------------------- tqdm bars (minillm)
+class TqdmLoggingHandler(logging.StreamHandler):
+    """Print log lines ABOVE an active tqdm bar instead of through it."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            if tqdm is not None:
+                tqdm.write(message, file=self.stream)
+            else:
+                self.stream.write(message + "\n")
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+
+def setup_logging() -> None:
+    """Same logging style as minillm: timestamped lines above the tqdm bar.
+
+    Also silences the libraries that log every HTTP range request / backend
+    probe at INFO, otherwise the training log is drowned in "HTTP Request:
+    GET ..." lines and "Resolving data files" bars.
+    """
+    handler = TqdmLoggingHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    )
+    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
+    for name in (
+        "httpx", "httpx2", "httpcore", "httpcore2",
+        "urllib3", "requests", "datasets", "huggingface_hub",
+        "huggingface_hub.utils._http", "fsspec", "numexpr",
+    ):
+        logging.getLogger(name).setLevel(logging.WARNING)
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # Xet opens background Rust threads for parquet range requests; at process
+    # exit those threads hit closed file descriptors and retry for ~30 s.
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    try:
+        from datasets import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def format_compact(value: float) -> str:
+    """Format a large number as 1.2k / 3.4M / 5.6B for a narrow tqdm bar."""
+    value = float(value)
+    if not math.isfinite(value):
+        return "nan"
+    if value >= 1e9:
+        return f"{value / 1e9:.2f}B"
+    if value >= 1e6:
+        return f"{value / 1e6:.2f}M"
+    if value >= 1e3:
+        return f"{value / 1e3:.1f}k"
+    return f"{value:.1f}"
+
+
+def style_progress_bar(pbar) -> None:
+    """Make the notebook bar green and keep all stats visible beside it."""
+    try:
+        desc_widget, bar_widget, stats_widget = pbar.container.children
+        pbar.container.layout.width = "100%"
+        desc_widget.layout.flex = "0 1 auto"
+        desc_widget.layout.overflow = "visible"
+        bar_widget.layout.flex = "0 0 15%"
+        bar_widget.layout.width = "15%"
+        bar_widget.layout.min_width = "60px"
+        stats_widget.layout.flex = "1 1 auto"
+        stats_widget.layout.min_width = "max-content"
+        stats_widget.layout.overflow = "visible"
+        bar_widget.bar_style = "success"
+    except Exception:
+        # Terminal tqdm has no widget container; colour="green" handles it.
+        pass
+
+
+def build_progress_bar(phase: int, max_steps, max_hours, state: RunState):
+    """minillm-style tqdm bar.
+
+    Percentage measures the **time budget** when ``--hours`` is given,
+    otherwise the **global step** budget. ``initial`` uses the resumed state so
+    a restarted run does not reset the bar to 0.
+    """
+    if tqdm is None:
+        return None
+
+    if max_steps:
+        total = float(max_steps)
+        initial = min(total, float(state.step))
+        unit, desc = "step", f"phase{phase}"
+    elif max_hours:
+        total = float(max_hours) * 3600.0
+        initial = min(total, max(0.0, 0.0))
+        unit, desc = "s", f"phase{phase} (time budget)"
+    else:
+        total = None
+        initial = float(state.step)
+        unit, desc = "step", f"phase{phase}"
+
+    pbar = tqdm(
+        total=total,
+        initial=initial,
+        desc=desc,
+        unit=unit,
+        dynamic_ncols=True,
+        postfix="",
+        colour="green",
+        # minillm's exact bar format: clean %, no awkward time values.
+        bar_format="{desc}: {percentage:3.0f}%|{bar}|{postfix}",
+    )
+    pbar._mv_time_based = bool(max_hours and not max_steps)
+    style_progress_bar(pbar)
+    return pbar
+
+
+def progress_update(pbar, max_hours, elapsed_seconds: float):
+    """Advance the bar by time (if hour budget) or by one step."""
+    if pbar is None:
+        return
+    time_based = getattr(pbar, "_mv_time_based", False)
+    pbar.update(max(0.0, elapsed_seconds) if time_based else 1)
+
+
+def show_sample_image(pixel, out_dir, step: int):
+    """Un-normalize a sample tensor, save it and display it in a notebook."""
+    from PIL import Image as PILImage
+
+    mean = (0.48145466, 0.4578275, 0.40821073)
+    std = (0.26862954, 0.26130258, 0.27577711)
+    x = pixel.detach().cpu().float()
+    while x.dim() > 3:
+        x = x[0]
+    undone = torch.zeros_like(x)
+    for c in range(3):
+        undone[c] = x[c] * std[c] + mean[c]
+    arr = (undone.clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype("uint8")
+
+    sample_dir = Path(out_dir) / "samples"
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    path = sample_dir / f"sample_step{step:07d}.png"
+    PILImage.fromarray(arr).save(path)
+
+    try:  # Kaggle / Jupyter: actually show the image
+        from IPython.display import display
+        display(PILImage.open(path))
+    except Exception:
+        pass
+    return path
+
+
+@torch.no_grad()
+def log_sample_generation(
+    model,
+    sample_iter,
+    device,
+    step: int,
+    pbar=None,
+    out_dir: str | Path | None = None,
+    max_new_tokens: int = 32,
+    temperature: float = 0.0,
+    top_k: int | None = None,
+    eos_id: int = 50256,
+):
+    """Generate from ONE held-out dataset image and print the result.
+
+    Used every ``sample_interval`` steps so you can *see* what the model
+    learned, not just watch the loss. Mirrors minillm's ``_log_sample``.
+    """
+    from data.tokenizer import EOT_TOKEN_ID, get_encoder
+
+    enc = get_encoder()
+    try:
+        ex = next(sample_iter)
+    except StopIteration:
+        return None
+
+    labels = ex["labels"]
+    n_prompt = sum(1 for t in labels if t == -100)
+    if n_prompt == 0 or n_prompt >= len(ex["input_ids"]):
+        return None
+    prompt_ids = ex["input_ids"][:n_prompt]
+    ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    pixel = ex["pixel_values"]
+    pixel = pixel.unsqueeze(0).to(device) if pixel is not None else None
+
+    was_training = model.training
+    model.eval()
+    try:
+        out = model.generate(
+            ids,
+            pixel_values=pixel,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            eos_id=eos_id,
+        )
+        prompt = enc.decode(prompt_ids)
+        generated = enc.decode(out[0, ids.size(1):].tolist())
+        ref_ids = [
+            t for t in ex["labels"] if t != -100 and t != EOT_TOKEN_ID
+        ]
+        ref = enc.decode(ref_ids)
+    except Exception as exc:
+        logger.warning("sample generation failed at step %d (%s): %s",
+                       step, type(exc).__name__, exc)
+        return None
+    finally:
+        model.train(was_training)
+
+    image_path = None
+    if out_dir is not None and pixel is not None:
+        try:
+            image_path = show_sample_image(pixel, out_dir, step)
+        except Exception as exc:
+            logger.warning("could not show sample image (%s): %s",
+                           type(exc).__name__, exc)
+
+    msg = (
+        f"sample @ step {step:,} | "
+        f"IMAGE: {image_path} | "
+        f"PROMPT: {' '.join(prompt.split())[:220]} | "
+        f"GENERATED: {' '.join(generated.split())[:220]} | "
+        f"REFERENCE: {' '.join(ref.split())[:120]}"
+    )
+    if pbar is not None:
+        pbar.write(msg)
+    else:
+        logger.info("%s", msg)
+    return msg
+
+
+def postfix(
+    state: RunState,
+    loss: float,
+    grad_norm: float = 0.0,
+    extra: str = "",
+) -> str:
+    """minillm-style live status string."""
+    ppl = math.exp(min(loss, 50.0)) if math.isfinite(loss) else float("nan")
+    return (
+        f"#{state.step:,} | loss {loss:.3f} | ppl {ppl:,.1f} | "
+        f"{format_compact(state.total_text_tokens)} tok | "
+        f"{format_compact(state.total_images_seen)} img | "
+        f"ep {state.epoch:.2f} | gn {grad_norm:.2f}{extra}"
+    )

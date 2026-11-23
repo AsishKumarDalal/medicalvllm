@@ -26,6 +26,7 @@ from .common import (
     RunState,
     StopSignal,
     atomic_torch_save,
+    build_progress_bar,
     build_checkpoint,
     build_lr_lambda,
     clip_grad_norm,
@@ -34,15 +35,20 @@ from .common import (
     latest_local_checkpoint,
     load_optimizer_state_named,
     load_yaml,
+    log_sample_generation,
     move_batch,
+    postfix,
+    progress_update,
     resolve_path,
     restore_state,
     save_plots,
     set_seed,
+    setup_logging,
+    shutdown_streaming_http,
 )
 from .hf_sync import download_latest, upload_checkpoint, upload_outs
 from data.collate import collate_fn
-from data.medical_vqa import BatchMixSampler, build_vqa_streams
+from data.medical_vqa import BatchMixSampler, SOURCES, VQAStream, build_vqa_streams
 from model.medical_vllm import MedicalVLLM
 
 logger = logging.getLogger(__name__)
@@ -157,6 +163,16 @@ def main(argv=None):
     accum = int(cfg.get("grad_accum_steps", 2))
     sampler = BatchMixSampler(streams, weights, batch_size, seed=args.seed)
     epoch_size = int(cfg["data"].get("epoch_size", 200_000))
+    sample_every = int(cfg.get("sample_interval", 500))
+    sample_stream = None
+    sample_iter = None
+    if sample_every > 0:
+        # One fixed held-out image source so samples are comparable over time.
+        sample_stream = VQAStream(
+            "vqa_rad", SOURCES["vqa_rad"][0], budget=budget,
+            shuffle_buffer=0, train=False, seed=args.seed + 12345,
+        )
+        sample_iter = iter(sample_stream)
 
     # ---------------------------------------------------------- optimization
     groups = [
@@ -180,10 +196,15 @@ def main(argv=None):
     state = RunState(phase=PHASE)
     if resume and not args.new:
         saved = torch.load(resume, map_location="cpu", weights_only=True)
-        restore_state(saved, state)
-        n = load_optimizer_state_named(model, optimizer, saved.get("optimizer"))
-        fast_forward_scheduler(scheduler, state.step)
-        state.resumed_from = str(resume)
+        is_ours = saved.get("format") in {"medicalvllm-v1", "medicalvllm-v2"}
+        n = 0
+        if is_ours:
+            restore_state(saved, state)
+            n = load_optimizer_state_named(
+                model, optimizer, saved.get("optimizer")
+            )
+            fast_forward_scheduler(scheduler, state.step)
+            state.resumed_from = str(resume)
         if int(saved.get("phase", 1)) == 1:
             # One-time, low-key hand-off notice for phase 1 -> phase 2.
             logger.info(
@@ -204,16 +225,20 @@ def main(argv=None):
     eval_cfg = cfg.get("eval") or {}
     eval_every = int(eval_cfg.get("every_steps", 0))
     dev_samples = int(eval_cfg.get("dev_samples", 100))
-    dev_iter = iter(BatchMixSampler(
+    dev_sampler = BatchMixSampler(
         build_vqa_streams(cfg["data"], budget=budget),
         {k: v for k, v in weights.items() if k != "text_replay"},
         batch_size=1, seed=args.seed + 1,
-    ))
+    )
+    dev_iter = iter(dev_sampler)
 
     t0 = time.time()
     last_save = t0
     interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
+    log_first = int(cfg.get("log_first_steps", 10))
+    log_every = int(cfg.get("log_interval", 100))
     running, nloss, micro, halted = 0.0, 0, 0, False
+    gn = 0.0
 
     def save(tag):
         ckpt = build_checkpoint(
@@ -235,6 +260,7 @@ def main(argv=None):
 
     logger.info("Stage 2 start: step=%d steps=%s hours=%s batch=%s accum=%s",
                 state.step, max_steps, max_hours, batch_size, accum)
+    pbar = build_progress_bar(PHASE, max_steps, max_hours, state)
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -276,7 +302,10 @@ def main(argv=None):
                 state.step += 1
                 avg = running / max(1, nloss)
                 running, nloss = 0.0, 0
-                if state.step % 10 == 0:
+                progress_update(pbar, max_hours, time.time() - t0)
+                if pbar is not None:
+                    pbar.set_postfix_str(postfix(state, avg, gn))
+                if state.step <= log_first or state.step % log_every == 0:
                     logger.info(
                         "step %d loss %.4f lr_c %.2e lr_l %.2e | tok %d img %d",
                         state.step, avg,
@@ -284,14 +313,23 @@ def main(argv=None):
                         optimizer.param_groups[1]["lr"],
                         state.total_text_tokens, state.total_images_seen,
                     )
-                    metrics.log(
-                        step=state.step, loss=round(avg, 5), source=source,
-                        lr_connector=optimizer.param_groups[0]["lr"],
-                        lr_llm=optimizer.param_groups[1]["lr"],
-                        grad_norm=round(gn, 4),
-                        total_text_tokens=state.total_text_tokens,
-                        total_images_seen=state.total_images_seen,
-                        epoch=round(state.epoch, 4),
+                metrics.log(
+                    step=state.step, loss=round(avg, 5), source=source,
+                    lr_connector=optimizer.param_groups[0]["lr"],
+                    lr_llm=optimizer.param_groups[1]["lr"],
+                    grad_norm=round(gn, 4),
+                    total_text_tokens=state.total_text_tokens,
+                    total_images_seen=state.total_images_seen,
+                    epoch=round(state.epoch, 4),
+                )
+
+                if sample_every and state.step % sample_every == 0:
+                    log_sample_generation(
+                        model, sample_iter, device, state.step, pbar,
+                        out_dir=out_dir,
+                        max_new_tokens=int(cfg.get("sample_max_new_tokens", 32)),
+                        temperature=float(cfg.get("sample_temperature", 0.0)),
+                        top_k=cfg.get("sample_top_k") or None,
                     )
 
             if eval_every and state.step and state.step % eval_every == 0:
@@ -307,6 +345,13 @@ def main(argv=None):
     except (KeyboardInterrupt, StopIteration):
         halted = True
     finally:
+        if pbar is not None:
+            pbar.close()
+        sampler.close()
+        dev_sampler.close()
+        if sample_stream is not None:
+            sample_stream.close()
+        shutdown_streaming_http()
         save("final")
         metrics.log(event="end", step=state.step, halted=halted,
                     hours=round((time.time() - t0) / 3600, 3),

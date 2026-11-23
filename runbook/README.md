@@ -3,6 +3,32 @@
 Environment verified on Kaggle: 2× Tesla T4 (15 GB), torch 2.11+cu130,
 transformers 5.20, datasets 4.8, open_clip 4.2 (pip-installed).
 
+## Progress bar and live samples
+
+Both trainers now use minillm's exact tqdm style:
+
+```
+phase1:  43%|████▊     |, #1,240 | loss 4.712 | ppl 111.2 | 1.2M tok | 38.4k img | ep 0.01 | gn 0.83
+```
+
+Green bar, clean percentage, and live stats beside it (step, loss, perplexity,
+text tokens, images, epoch, grad norm). Log lines are printed **above** the bar,
+not through it. Full INFO lines only for the first 10 steps and every 100 steps
+after; the bar is the live display. Configure with `log_first_steps` and
+`log_interval`.
+
+Every `sample_interval` steps (default **500**, set `0` to disable) one real
+dataset example is taken and shown:
+
+- the image is un-normalized, saved to `outs/samples/sample_step{N}.png` and
+  displayed inline in Kaggle/Jupyter;
+- `PROMPT` (question only — the answer is **not** leaked into generation),
+- `GENERATED` (greedy by default),
+- `REFERENCE` (the dataset answer).
+
+Phase 1 samples from ROCOv2 captions; Phase 2 from a fixed VQA-RAD source so
+samples stay comparable across steps.
+
 ## Flags (both stages)
 
 | Flag | Effect |
@@ -123,3 +149,4 @@ the latter has no image blob, so the `_small` variant is preferred.
 | `No module named open_clip` | `pip install open_clip_torch` |
 | tower weights saved in checkpoint | never happens; only encoder name is stored |
 | loss spike at step 0 | gate init 0.1 + frozen-LLM Stage 1 should prevent it |
+| `Bad file descriptor` + retry loop on exit | datasets streaming race at interpreter shutdown; fixed by closing generators, stopping the fsspec IO loop and a 2 s drain in `shutdown_streaming_http()` |

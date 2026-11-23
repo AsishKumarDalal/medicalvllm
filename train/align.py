@@ -24,6 +24,7 @@ from .common import (
     RunState,
     StopSignal,
     atomic_torch_save,
+    build_progress_bar,
     build_checkpoint,
     build_lr_lambda,
     clip_grad_norm,
@@ -32,11 +33,16 @@ from .common import (
     latest_local_checkpoint,
     load_optimizer_state_named,
     load_yaml,
+    log_sample_generation,
     move_batch,
+    postfix,
+    progress_update,
     resolve_path,
     restore_state,
     save_plots,
     set_seed,
+    setup_logging,
+    shutdown_streaming_http,
 )
 from .hf_sync import download_latest, upload_checkpoint, upload_outs
 from data.captions import CaptionStream
@@ -109,8 +115,7 @@ def main(argv=None):
         _detach()
         return
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+    setup_logging()   # minillm-style: log lines appear above the tqdm bar
     set_seed(args.seed)
     base = Path(args.config).resolve().parents[1]
     cfg = load_yaml(args.config)
@@ -165,6 +170,17 @@ def main(argv=None):
     )
     data_iter = iter(stream)
     epoch_size = int(dcfg.get("epoch_size", 130_000))
+    sample_every = int(cfg.get("sample_interval", 500))
+    sample_stream = None
+    sample_iter = None
+    if sample_every > 0:
+        sample_stream = CaptionStream(
+            dataset=dcfg.get("dataset", "eltorio/ROCOv2-radiology"),
+            budget=int(dcfg.get("max_text_tokens", 112)),
+            image_size=int(vision_cfg.get("image_size", 224)),
+            train=False, shuffle_buffer=0, seed=args.seed + 12345,
+        )
+        sample_iter = iter(sample_stream)
 
     # ---------------------------------------------------------- optimization
     batch_size = int(cfg.get("batch_size", 16))
@@ -184,22 +200,36 @@ def main(argv=None):
     state = RunState(phase=PHASE)
     if resume and not args.new:
         saved = torch.load(resume, map_location="cpu", weights_only=True)
-        restore_state(saved, state)
-        n = load_optimizer_state_named(model, optimizer, saved.get("optimizer"))
-        fast_forward_scheduler(scheduler, state.step)
-        state.resumed_from = str(resume)
-        logger.info(
-            "resumed phase 1: step=%d epoch=%.3f text_tokens=%d images=%d "
-            "(optimizer params restored: %d)",
-            state.step, state.epoch, state.total_text_tokens,
-            state.total_images_seen, n,
-        )
+        # A plain minillm SFT checkpoint is a WEIGHTS-ONLY starting point: its
+        # own `step` belongs to the old SFT run, so start our counters at 0.
+        is_ours = saved.get("format") in {"medicalvllm-v1", "medicalvllm-v2"}
+        if is_ours:
+            restore_state(saved, state)
+            n = load_optimizer_state_named(
+                model, optimizer, saved.get("optimizer")
+            )
+            fast_forward_scheduler(scheduler, state.step)
+            state.resumed_from = str(resume)
+        else:
+            n = 0
+        if is_ours:
+            logger.info(
+                "resumed phase 1: step=%d epoch=%.3f text_tokens=%d images=%d "
+                "(optimizer params restored: %d)",
+                state.step, state.epoch, state.total_text_tokens,
+                state.total_images_seen, n,
+            )
+        else:
+            logger.info("starting phase 1 from SFT weights at global step 0")
 
     metrics = Metrics(out_dir)
     t0 = time.time()
     last_save = t0
     interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
+    log_first = int(cfg.get("log_first_steps", 10))
+    log_every = int(cfg.get("log_interval", 100))
     running, nloss, micro, halted = 0.0, 0, 0, False
+    gn = 0.0
 
     def save(tag):
         ckpt = build_checkpoint(
@@ -220,6 +250,7 @@ def main(argv=None):
 
     logger.info("Stage 1 start: step=%d steps=%s hours=%s batch=%s accum=%s",
                 state.step, max_steps, max_hours, batch_size, accum)
+    pbar = build_progress_bar(PHASE, max_steps, max_hours, state)
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -261,18 +292,31 @@ def main(argv=None):
                 state.step += 1
                 avg = running / max(1, nloss)
                 running, nloss = 0.0, 0
-                if state.step % 10 == 0:
+
+                progress_update(pbar, max_hours, time.time() - t0)
+                if pbar is not None:
+                    pbar.set_postfix_str(postfix(state, avg, gn))
+                if state.step <= log_first or state.step % log_every == 0:
                     logger.info(
                         "step %d loss %.4f lr %.2e gn %.3f | tok %d img %d",
                         state.step, avg, scheduler.get_last_lr()[0], gn,
                         state.total_text_tokens, state.total_images_seen,
                     )
-                    metrics.log(step=state.step, loss=round(avg, 5),
-                                lr=scheduler.get_last_lr()[0],
-                                grad_norm=round(gn, 4),
-                                total_text_tokens=state.total_text_tokens,
-                                total_images_seen=state.total_images_seen,
-                                epoch=round(state.epoch, 4))
+                metrics.log(step=state.step, loss=round(avg, 5),
+                            lr=scheduler.get_last_lr()[0],
+                            grad_norm=round(gn, 4),
+                            total_text_tokens=state.total_text_tokens,
+                            total_images_seen=state.total_images_seen,
+                            epoch=round(state.epoch, 4))
+
+                if sample_every and state.step % sample_every == 0:
+                    log_sample_generation(
+                        model, sample_iter, device, state.step, pbar,
+                        out_dir=out_dir,
+                        max_new_tokens=int(cfg.get("sample_max_new_tokens", 32)),
+                        temperature=float(cfg.get("sample_temperature", 0.0)),
+                        top_k=cfg.get("sample_top_k") or None,
+                    )
 
             now = time.time()
             if now - last_save >= interval:
@@ -281,6 +325,13 @@ def main(argv=None):
     except KeyboardInterrupt:
         halted = True
     finally:
+        if pbar is not None:
+            pbar.close()
+        # Release streaming HTTP connections before interpreter shutdown.
+        stream.close()
+        if sample_stream is not None:
+            sample_stream.close()
+        shutdown_streaming_http()
         save("final")
         metrics.log(event="end", step=state.step, halted=halted,
                     hours=round((time.time() - t0) / 3600, 3),

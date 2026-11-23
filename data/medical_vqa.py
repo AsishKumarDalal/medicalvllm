@@ -71,8 +71,18 @@ class VQAStream:
             "seen": 0, "kept": 0, "dropped": 0,
             "no_image": 0, "bad_image": 0,
         }
+        self._active_gen = None
 
     def __iter__(self) -> Iterator[dict]:
+        self._active_gen = self._generate()
+        return self._active_gen
+
+    def close(self):
+        if self._active_gen is not None:
+            self._active_gen.close()
+            self._active_gen = None
+
+    def _generate(self) -> Iterator[dict]:
         from datasets import load_dataset
 
         try:
@@ -214,6 +224,10 @@ class BatchMixSampler:
             if batch:
                 return name, batch
         raise StopIteration
+
+    def close(self):
+        for stream in self.streams.values():
+            stream.close()
 
     def _take(self, name: str, n: int) -> list:
         out = []

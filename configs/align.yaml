@@ -16,6 +16,10 @@ warmup_steps: 200
 epochs: 2
 hours: 4
 grad_clip: 1.0
+sample_interval: 500          # every N steps: show 1 dataset image + generation
+sample_max_new_tokens: 32
+sample_temperature: 0.0       # greedy, so samples are reproducible
+sample_top_k: null
 checkpoint_interval_minutes: 60
 checkpoint_dir: /kaggle/temp/medicalvllm/align
 out_dir: /kaggle/temp/medicalvllm/outs/align
