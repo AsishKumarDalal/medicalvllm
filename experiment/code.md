@@ -27,6 +27,80 @@ built and tested. Design rationale lives in [vllm.md](vllm.md) and
 
 ---
 
+## 1.1 Reuse map — what comes from minillm, what is new
+
+| minillm asset | Reuse? | How |
+| --- | --- | --- |
+| `model/model.py` (`GPT`) | **yes, copied** | one refactor: add `forward_embeds`, keep `forward` as a thin wrapper |
+| `model/model_parts.py` | **yes, copied verbatim** | `TransformerBlock`, attention, FFN, LayerNorm, `LayerKVCache` |
+| `configs/model.yaml` | **yes, copied** | 768-d, 1024 context, 9 layers, tied head |
+| GPT-2 BPE tokenizer + EOT 50256 | **yes, helper copied** | tiktoken encoding from `pretrain/data.py`; no new vocab |
+| SFT checkpoint loader | **yes, pattern copied** | read `state["model"]`, validate `state["model_config"]`, `load_state_dict(strict=True)` |
+| `sft/tuning.py` training loop | **pattern ported** | atomic saves, hourly checkpoints, plots, detach/status/stop, HF sync |
+| `pretrain/train.py` helpers | **pattern ported** | `--hours`, `--steps`, SIGTERM-safe final save |
+| OpenWebText / Dolly data streams | **no** | replaced by ROCOv2 captions + medical VQA |
+| MoE model, tool-calling SFT, DPO | **no** | out of scope; dense decoder only |
+| `experiments/` benchmark scripts | **no** | new eval harness instead |
+
+**Why copy instead of importing `minillm`?** Kaggle mounts each repo as its
+own directory; `medicalvllm` must run standalone (`python -m train.align`
+from its own root). Vendoring also freezes the decoder version, so changes in
+`minillm` cannot silently break medical training. Record the source commit in
+`model/minillm/SYNC.md`.
+
+### Loading the SFT checkpoint
+
+```python
+state = torch.load(path, map_location="cpu", weights_only=True)
+assert state["model_config"]["emb_dim"] == llm_cfg["emb_dim"]
+self.llm.load_state_dict(state["model"], strict=True)
+```
+
+`state["model"]` has **unprefixed** keys (`tok_emb.weight`, `trf_blocks.0...`),
+because minillm unwraps `DataParallel` before saving. We load it into
+`self.llm` (the inner GPT), not into `MedicalVLLM`, so the keys match exactly.
+The wrapper's own checkpoint later stores `llm.*`, `connector.*`, but Stage 1
+initialization always reads the plain minillm format first.
+
+### Exact `forward_embeds` refactor
+
+Before (current minillm):
+
+```python
+def forward(self, in_idx, y=None, ignore_index=-100, use_cache=False):
+    _, seq_len = in_idx.shape
+    # cache checks, positions ...
+    token_embedding = self.tok_emb(in_idx)
+    x = token_embedding + self.pos_emb(positions)
+    x = self.drop_emb(x)
+    # blocks, final_norm, out_head, loss ...
+```
+
+After (vendored copy):
+
+```python
+def forward(self, in_idx, y=None, ignore_index=-100, use_cache=False):
+    return self.forward_embeds(
+        self.tok_emb(in_idx),
+        y=y, ignore_index=ignore_index, use_cache=use_cache,
+    )
+
+def forward_embeds(self, x_embeds, y=None, ignore_index=-100,
+                   use_cache=False):
+    _, seq_len, _ = x_embeds.shape
+    # SAME cache checks, positions ...
+    x = x_embeds + self.pos_emb(positions)
+    x = self.drop_emb(x)
+    # SAME blocks, final_norm, out_head, loss ...
+```
+
+Nothing else changes: absolute positions, KV-cache offsets, loss masking,
+weight tying and the output head are untouched. `forward()` remains
+behavior-identical, which is what lets the old tiny tests and the SFT
+checkpoint keep working.
+
+---
+
 ## 2. Module dependencies
 
 ```mermaid
