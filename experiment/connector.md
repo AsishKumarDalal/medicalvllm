@@ -19,13 +19,13 @@ See [vllm.md](vllm.md) for the full project plan and
 
 ```mermaid
 flowchart LR
-    IMG["Medical image"] --> ENC["Frozen vision encoder<br/>BiomedCLIP"]
-    ENC --> P["196 patch vectors<br/>each 768 numbers"]
-    P --> CONN["CONNECTOR<br/>reads 196 → writes 64"]
-    CONN --> V["64 visual vectors<br/>each 768 numbers"]
-    Q["Question text"] --> GPT["minillm GPT"]
+    IMG["Medical image<br/>B × 3 × 224 × 224"] --> ENC["Frozen vision encoder<br/>BiomedCLIP<br/>out B × 196 × 768"]
+    ENC --> P["196 patch vectors<br/>B × 196 × 768"]
+    P --> CONN["CONNECTOR<br/>reads 196 → writes 64<br/>out B × 64 × 768"]
+    CONN --> V["64 visual vectors<br/>B × 64 × 768"]
+    Q["Question tokens<br/>B × T"] --> GPT["minillm GPT<br/>out B × (64+T) × 50257"]
     V --> GPT
-    GPT --> A["Answer text"]
+    GPT --> A["Answer logits<br/>B × (64+T) × 50257"]
 ```
 
 Think of it as a **compressor with a purpose**:
@@ -48,10 +48,10 @@ roles; they are learned from data.
 
 ```mermaid
 flowchart TD
-    QQ["One query vector"] --> ATT["Compare it with all 196 patches<br/>compute one score per patch"]
-    PP["196 patch vectors"] --> ATT
-    ATT --> W["Softmax over the 196 scores<br/>→ weights that sum to 1"]
-    W --> SUM["Weighted average of the patches<br/>= one summary vector"]
+    QQ["One query vector<br/>768"] --> ATT["Compare it with all 196 patches<br/>compute one score per patch"]
+    PP["196 patch vectors<br/>B × 196 × 768"] --> ATT
+    ATT --> W["196 attention weights<br/>B × 196<br/>softmax → sum to 1"]
+    W --> SUM["One summary vector<br/>B × 768"]
 ```
 
 So one query produces **one summary vector**. With 64 queries, we get 64
@@ -59,9 +59,9 @@ summary vectors:
 
 ```mermaid
 flowchart LR
-    Q["64 queries"] --> R["resampler"]
-    P["196 patches"] --> R
-    R --> O["64 summaries"]
+    Q["64 queries<br/>64 × 768"] --> R["resampler"]
+    P["196 patches<br/>B × 196 × 768"] --> R
+    R --> O["64 summaries<br/>B × 64 × 768"]
 ```
 
 The comparison step is called **cross-attention**: the queries are the
@@ -82,15 +82,15 @@ sequenceDiagram
     participant GPT as GPT
     participant OUT as Answer
 
-    IMG->>VIT: 224 x 224 pixels
-    VIT-->>CON: 196 patch vectors
-    Note over CON: start with 64 learned queries
-    CON->>CON: block 1: queries look at patches, then think (FFN)
-    CON->>CON: block 2: same again
-    CON->>CON: LayerNorm -> Linear -> multiply by gate
-    CON-->>GPT: 64 visual vectors
-    GPT->>GPT: prepend them to the question tokens
-    GPT-->>OUT: generated answer
+    IMG->>VIT: B × 3 × 224 × 224 pixels
+    VIT-->>CON: B × 196 × 768 patch vectors
+    Note over CON: start with 64 learned queries (64 × 768)
+    CON->>CON: block 1 → B × 64 × 768
+    CON->>CON: block 2 → B × 64 × 768
+    CON->>CON: LayerNorm → Linear → gate<br/>out B × 64 × 768
+    CON-->>GPT: B × 64 × 768 visual vectors
+    GPT->>GPT: concat with text → B × (64+T) × 768
+    GPT-->>OUT: logits B × (64+T) × 50257
 ```
 
 In words:
@@ -112,26 +112,26 @@ In words:
 
 ```mermaid
 flowchart TB
-    Q["q<br/>B × 64 × 768"] --> LNQ["LayerNorm"]
-    KV["patches<br/>B × 196 × 768"] --> LNKV["LayerNorm"]
+    Q["q<br/>B × 64 × 768"] --> LNQ["LayerNorm<br/>out B × 64 × 768"]
+    KV["patches<br/>B × 196 × 768"] --> LNKV["LayerNorm<br/>out B × 196 × 768"]
 
-    LNQ --> QP["Q projection"]
-    LNKV --> KP["K projection"]
-    LNKV --> VP["V projection"]
+    LNQ --> QP["Q projection<br/>out B × 64 × 768"]
+    LNKV --> KP["K projection<br/>out B × 196 × 768"]
+    LNKV --> VP["V projection<br/>out B × 196 × 768"]
 
-    QP --> ATT["cross-attention<br/>12 heads, head_dim 64<br/>no causal mask"]
+    QP --> ATT["cross-attention<br/>scores B × 12 × 64 × 196<br/>out B × 64 × 768"]
     KP --> ATT
     VP --> ATT
-    ATT --> OP["output projection"]
-    OP --> R1(("+"))
+    ATT --> OP["output projection<br/>out B × 64 × 768"]
+    OP --> R1["⊕ residual<br/>out B × 64 × 768"]
     Q --> R1
-    R1 --> H["updated queries"]
+    R1 --> H["updated queries<br/>B × 64 × 768"]
 
-    H --> LNF["LayerNorm"]
-    LNF --> F1["Linear 768 → 3072"]
-    F1 --> GELU["GELU"]
-    GELU --> F2["Linear 3072 → 768"]
-    F2 --> R2(("+"))
+    H --> LNF["LayerNorm<br/>out B × 64 × 768"]
+    LNF --> F1["Linear 768 → 3072<br/>out B × 64 × 3072"]
+    F1 --> GELU["GELU<br/>out B × 64 × 3072"]
+    GELU --> F2["Linear 3072 → 768<br/>out B × 64 × 768"]
+    F2 --> R2["⊕ residual<br/>out B × 64 × 768"]
     H --> R2
     R2 --> OUT["q′<br/>B × 64 × 768"]
 ```
@@ -158,12 +158,12 @@ between queries is possible but harmless at this scale.
 
 ```mermaid
 flowchart LR
-    A["image<br/>B × 3 × 224 × 224"] --> B["ViT patches<br/>B × 196 × 768"]
-    B --> C["block 1<br/>B × 196 × 768<br/>(K, V unchanged)"]
-    C --> D["block 2<br/>B × 64 × 768<br/>(queries updated)"]
-    D --> E["LayerNorm<br/>B × 64 × 768"]
-    E --> F["Linear + gate<br/>B × 64 × 768"]
-    F --> G["prepend to text<br/>B × (64 + T) × 768"]
+    A["image<br/>B × 3 × 224 × 224"] --> B["ViT patches<br/>out B × 196 × 768"]
+    B --> C["block 1<br/>queries out B × 64 × 768<br/>K, V stay B × 196 × 768"]
+    C --> D["block 2<br/>out B × 64 × 768"]
+    D --> E["LayerNorm<br/>out B × 64 × 768"]
+    E --> F["Linear + gate<br/>out B × 64 × 768"]
+    F --> G["prepend to text<br/>out B × (64 + T) × 768"]
     G --> H["GPT<br/>logits B × (64 + T) × 50257"]
 
     style B fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5
@@ -193,17 +193,17 @@ The visual prefix is never supervised; cross-entropy ignores all 64 positions.
 
 ```mermaid
 flowchart LR
-    IMG["Medical image<br/>B × 3 × 224 × 224"] --> TOWER["BiomedCLIP ViT-B/16<br/>frozen · fp16 · no_grad"]
+    IMG["Medical image<br/>B × 3 × 224 × 224"] --> TOWER["BiomedCLIP ViT-B/16<br/>frozen · fp16 · no_grad<br/>out B × 196 × 768"]
     TOWER --> PATCH["Patch tokens<br/>B × 196 × 768"]
-    PATCH --> CONN["Connector<br/>Perceiver resampler"]
+    PATCH --> CONN["Connector<br/>Perceiver resampler<br/>out B × 64 × 768"]
     Q["Learned queries<br/>64 × 768"] --> CONN
     CONN --> PREFIX["Visual prefix<br/>B × 64 × 768"]
 
-    TXT["Token ids<br/>B × T"] --> EMB["tok_emb<br/>B × T × 768"]
-    PREFIX --> CAT["concatenate<br/>B × (64+T) × 768"]
+    TXT["Token ids<br/>B × T"] --> EMB["tok_emb<br/>out B × T × 768"]
+    PREFIX --> CAT["concatenate<br/>out B × (64+T) × 768"]
     EMB --> CAT
-    CAT --> POS["+ absolute pos_emb<br/>positions 0 .. 63+T"]
-    POS --> GPT["minillm GPT<br/>9 blocks · causal"]
+    CAT --> POS["+ absolute pos_emb<br/>positions 0 .. 63+T<br/>out B × (64+T) × 768"]
+    POS --> GPT["minillm GPT<br/>9 blocks · causal<br/>out B × (64+T) × 768"]
     GPT --> LOGITS["Logits<br/>B × (64+T) × 50257"]
 
     classDef frozen fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5,color:#444
@@ -326,8 +326,8 @@ Why these details matter:
 
 ```mermaid
 flowchart LR
-    P["196 patches<br/>B × 196 × 768"] --> R["reshape to 14 × 14 grid"] --> AP["2 × 2 average pool<br/>→ 7 × 7 = 49 tokens"]
-    AP --> L1["Linear 768 → 768"] --> G["GELU"] --> L2["Linear 768 → 768"] --> O["49 visual vectors"]
+    P["196 patches<br/>B × 196 × 768"] --> R["reshape to grid<br/>out B × 768 × 14 × 14"] --> AP["2 × 2 average pool<br/>out B × 768 × 7 × 7"]
+    AP --> FL["flatten + transpose<br/>out B × 49 × 768"] --> L1["Linear 768 → 768<br/>out B × 49 × 768"] --> G["GELU<br/>out B × 49 × 768"] --> L2["Linear 768 → 768<br/>out B × 49 × 768"] --> O["49 visual vectors<br/>B × 49 × 768"]
 ```
 
 | | Perceiver (default) | Pooled MLP |
