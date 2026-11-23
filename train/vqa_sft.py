@@ -33,6 +33,7 @@ from .common import (
     fast_forward_scheduler,
     get_device,
     latest_local_checkpoint,
+    select_devices,
     load_optimizer_state_named,
     load_yaml,
     log_sample_generation,
@@ -45,6 +46,7 @@ from .common import (
     set_seed,
     setup_logging,
     shutdown_streaming_http,
+    unwrap_model,
 )
 from .hf_sync import download_latest, upload_checkpoint, upload_outs
 from data.collate import collate_fn
@@ -94,6 +96,8 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--hours", type=float, default=None)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--num-gpus", type=int, default=None,
+                    help="max GPUs for DataParallel (default: config num_gpus=2)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stop", default=None)
     ap.add_argument("--detach", action="store_true")
@@ -114,7 +118,10 @@ def main(argv=None):
     set_seed(args.seed)
     base = Path(args.config).resolve().parents[1]
     cfg = load_yaml(args.config)
-    device = get_device(args.device)
+    device, gpu_ids = select_devices(
+        args.device,
+        args.num_gpus if args.num_gpus is not None else int(cfg.get("num_gpus", 2)),
+    )
     stop = StopSignal(args.stop or (base / ".stop_vqa"))
 
     use_hf = bool(args.hf) and not args.no_hf
@@ -221,6 +228,14 @@ def main(argv=None):
                 state.total_images_seen, n,
             )
 
+    base_model = model
+    if len(gpu_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+        logger.info("using nn.DataParallel across %d GPUs: %s",
+                    len(gpu_ids), gpu_ids)
+    else:
+        logger.info("using device %s", device)
+
     metrics = Metrics(out_dir)
     eval_cfg = cfg.get("eval") or {}
     eval_every = int(eval_cfg.get("every_steps", 0))
@@ -242,7 +257,7 @@ def main(argv=None):
 
     def save(tag):
         ckpt = build_checkpoint(
-            model, state, optimizer, scheduler,
+            base_model, state, optimizer, scheduler,
             {k: v.stats for k, v in streams.items()},
             llm_cfg, vision_cfg, connector_cfg,
         )
@@ -282,6 +297,8 @@ def main(argv=None):
                 labels=batch["labels"],
             )
             loss = out[1] if isinstance(out, tuple) else out
+            if loss.dim() > 0:      # DataParallel gathers scalar losses into a vector
+                loss = loss.mean()
             (loss / accum).backward()
             running += loss.item()
             nloss += 1
@@ -325,7 +342,7 @@ def main(argv=None):
 
                 if sample_every and state.step % sample_every == 0:
                     log_sample_generation(
-                        model, sample_iter, device, state.step, pbar,
+                        base_model, sample_iter, device, state.step, pbar,
                         out_dir=out_dir,
                         max_new_tokens=int(cfg.get("sample_max_new_tokens", 32)),
                         temperature=float(cfg.get("sample_temperature", 0.0)),
@@ -333,7 +350,7 @@ def main(argv=None):
                     )
 
             if eval_every and state.step and state.step % eval_every == 0:
-                score = _quick_eval(model, dev_iter, dev_samples, device)
+                score = _quick_eval(base_model, dev_iter, dev_samples, device)
                 metrics.log(step=state.step, eval_loss=round(score, 5))
                 logger.info("eval loss %.4f", score)
                 model.train()

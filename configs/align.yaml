@@ -9,6 +9,7 @@ data:
   max_image_size: 512
   epoch_size: 130000              # ROCOv2 train rows (for approximate epoch count)
 freeze_llm: true
+num_gpus: 2                     # use both GPUs via nn.DataParallel when available
 batch_size: 16
 grad_accum_steps: 2
 learning_rate: 1.0e-4

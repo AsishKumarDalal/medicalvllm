@@ -6,6 +6,7 @@ data:
   shuffle_buffer: 1000
   epoch_size: 200000           # approximate mixed-dataset size (epoch reporting)
 freeze_llm: false
+num_gpus: 2                     # use both GPUs via nn.DataParallel when available
 lora: {enabled: false, r: 16, alpha: 32}
 lr_llm: 1.0e-5
 lr_connector: 5.0e-5

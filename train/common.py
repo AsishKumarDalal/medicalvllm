@@ -57,6 +57,36 @@ def get_device(name: str = "auto") -> torch.device:
     return torch.device(name)
 
 
+def select_devices(name: str = "auto", num_gpus: int = 2):
+    """Return ``(device, gpu_ids)`` — like minillm's ``select_device``.
+
+    ``gpu_ids`` has more than one entry only when the caller wants multiple
+    GPUs and CUDA actually exposes them; trainers then wrap with
+    ``nn.DataParallel``.
+    """
+    requested = str(name).lower().strip()
+    if requested == "cpu":
+        return torch.device("cpu"), []
+    if not torch.cuda.is_available():
+        logger.warning("CUDA unavailable; using CPU")
+        return torch.device("cpu"), []
+    if requested.startswith("cuda:") and ":" in requested:
+        try:
+            idx = int(requested.split(":", 1)[1])
+        except ValueError:
+            idx = 0
+        if idx >= torch.cuda.device_count():
+            logger.warning("cuda:%d unavailable; using cuda:0", idx)
+            idx = 0
+        return torch.device(f"cuda:{idx}"), [idx]
+    n = max(1, min(int(num_gpus), torch.cuda.device_count()))
+    return torch.device("cuda:0"), list(range(n))
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.DataParallel) else model
+
+
 # ---------------------------------------------------------------------- saves
 def atomic_torch_save(state: dict, path: str | Path):
     path = Path(path)
@@ -477,12 +507,14 @@ def style_progress_bar(pbar) -> None:
     try:
         desc_widget, bar_widget, stats_widget = pbar.container.children
         pbar.container.layout.width = "100%"
-        desc_widget.layout.flex = "0 1 auto"
+        desc_widget.layout.flex = "0 0 auto"
+        desc_widget.layout.width = "auto"
         desc_widget.layout.overflow = "visible"
-        bar_widget.layout.flex = "0 0 15%"
-        bar_widget.layout.width = "15%"
+        bar_widget.layout.flex = "0 0 12%"
+        bar_widget.layout.width = "12%"
         bar_widget.layout.min_width = "60px"
         stats_widget.layout.flex = "1 1 auto"
+        stats_widget.layout.width = "auto"
         stats_widget.layout.min_width = "max-content"
         stats_widget.layout.overflow = "visible"
         bar_widget.bar_style = "success"
@@ -519,7 +551,10 @@ def build_progress_bar(phase: int, max_steps, max_hours, state: RunState):
         initial=initial,
         desc=desc,
         unit=unit,
-        dynamic_ncols=True,
+        # Fixed width: dynamic_ncols in a Kaggle output cell is detected as a
+        # tiny terminal, which clips the right-hand stats. 150 cols keeps the
+        # whole postfix visible; terminals wrap instead of cutting it.
+        ncols=150,
         postfix="",
         colour="green",
         # minillm's exact bar format: clean %, no awkward time values.
@@ -652,7 +687,7 @@ def postfix(
     grad_norm: float = 0.0,
     extra: str = "",
 ) -> str:
-    """minillm-style live status string."""
+    """Full minillm-style live status string (all stats, no truncation)."""
     ppl = math.exp(min(loss, 50.0)) if math.isfinite(loss) else float("nan")
     return (
         f"#{state.step:,} | loss {loss:.3f} | ppl {ppl:,.1f} | "

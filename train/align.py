@@ -31,6 +31,7 @@ from .common import (
     fast_forward_scheduler,
     get_device,
     latest_local_checkpoint,
+    select_devices,
     load_optimizer_state_named,
     load_yaml,
     log_sample_generation,
@@ -43,6 +44,7 @@ from .common import (
     set_seed,
     setup_logging,
     shutdown_streaming_http,
+    unwrap_model,
 )
 from .hf_sync import download_latest, upload_checkpoint, upload_outs
 from data.captions import CaptionStream
@@ -100,6 +102,8 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=None)
     ap.add_argument("--hours", type=float, default=None)
     ap.add_argument("--device", default="auto")
+    ap.add_argument("--num-gpus", type=int, default=None,
+                    help="max GPUs for DataParallel (default: config num_gpus=2)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stop", default=None)
     ap.add_argument("--detach", action="store_true")
@@ -119,7 +123,10 @@ def main(argv=None):
     set_seed(args.seed)
     base = Path(args.config).resolve().parents[1]
     cfg = load_yaml(args.config)
-    device = get_device(args.device)
+    device, gpu_ids = select_devices(
+        args.device,
+        args.num_gpus if args.num_gpus is not None else int(cfg.get("num_gpus", 2)),
+    )
     stop = StopSignal(args.stop or (base / ".stop_align"))
 
     # -- CLI flags override config. No upload unless --hf is given.
@@ -222,6 +229,16 @@ def main(argv=None):
         else:
             logger.info("starting phase 1 from SFT weights at global step 0")
 
+    # DataParallel uses every visible GPU; keep an unwrapped handle for
+    # state_dict, sampling and config access (avoids "module." key prefixes).
+    base_model = model
+    if len(gpu_ids) > 1:
+        model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+        logger.info("using nn.DataParallel across %d GPUs: %s",
+                    len(gpu_ids), gpu_ids)
+    else:
+        logger.info("using device %s", device)
+
     metrics = Metrics(out_dir)
     t0 = time.time()
     last_save = t0
@@ -233,8 +250,8 @@ def main(argv=None):
 
     def save(tag):
         ckpt = build_checkpoint(
-            model, state, optimizer, scheduler,
-            stream.stats, llm_cfg, vision_cfg, model.connector_cfg,
+            base_model, state, optimizer, scheduler,
+            stream.stats, llm_cfg, vision_cfg, base_model.connector_cfg,
         )
         step_path = ckpt_dir / f"phase1_step{state.step:07d}.pt"
         atomic_torch_save(ckpt, step_path)
@@ -272,6 +289,8 @@ def main(argv=None):
                 labels=batch["labels"],
             )
             loss = out[1] if isinstance(out, tuple) else out
+            if loss.dim() > 0:      # DataParallel gathers scalar losses into a vector
+                loss = loss.mean()
             (loss / accum).backward()
             running += loss.item()
             nloss += 1
@@ -311,7 +330,7 @@ def main(argv=None):
 
                 if sample_every and state.step % sample_every == 0:
                     log_sample_generation(
-                        model, sample_iter, device, state.step, pbar,
+                        base_model, sample_iter, device, state.step, pbar,
                         out_dir=out_dir,
                         max_new_tokens=int(cfg.get("sample_max_new_tokens", 32)),
                         temperature=float(cfg.get("sample_temperature", 0.0)),

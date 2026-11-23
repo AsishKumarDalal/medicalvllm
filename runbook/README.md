@@ -11,11 +11,17 @@ Both trainers now use minillm's exact tqdm style:
 phase1:  43%|████▊     |, #1,240 | loss 4.712 | ppl 111.2 | 1.2M tok | 38.4k img | ep 0.01 | gn 0.83
 ```
 
-Green bar, clean percentage, and live stats beside it (step, loss, perplexity,
-text tokens, images, epoch, grad norm). Log lines are printed **above** the bar,
-not through it. Full INFO lines only for the first 10 steps and every 100 steps
-after; the bar is the live display. Configure with `log_first_steps` and
-`log_interval`.
+Green bar, clean percentage, and **all** live stats beside it (step, loss,
+perplexity, text tokens, images, epoch, grad norm). The bar uses a fixed
+150-column width so Kaggle's narrow output cell cannot clip the right-hand
+stats. Log lines are printed **above** the bar, not through it. Full INFO lines
+only for the first 10 steps and every 100 steps after; the bar is the live
+display. Configure with `log_first_steps` and `log_interval`.
+
+**Multi-GPU:** `num_gpus: 2` in each config (or `--num-gpus N`) wraps the model
+in `nn.DataParallel` when several GPUs are visible. Optimizer state, sampling,
+eval and checkpoints always use the unwrapped model, so weights are saved
+without a `module.` prefix. Use `--device cuda:0` to force a single GPU.
 
 Every `sample_interval` steps (default **500**, set `0` to disable) one real
 dataset example is taken and shown:
