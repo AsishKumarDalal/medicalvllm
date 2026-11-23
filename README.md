@@ -85,6 +85,7 @@ python -m train.align --steps 2   # watch a real training step happen
 | `experiment/vllm.md` | the plan (source of truth) |
 | `experiment/connector.md` | connector architecture in detail (Mermaid diagrams) |
 | `experiment/code.md` | coding plan: modules, interfaces, build order, tests |
+| `experiment/data_training.md` | how one dataset row becomes a gradient; both stages |
 | `configs/` | model / vision / align / vqa_sft configs |
 | `model/` | vision tower, connector, MedicalVLLM wrapper, vendored minillm GPT |
 | `model/minillm/SYNC.md` | source commit + the single `forward_embeds` refactor |
