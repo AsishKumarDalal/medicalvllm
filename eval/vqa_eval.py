@@ -1,9 +1,9 @@
 """Greedy VQA evaluation with a blind baseline.
 
-For every example we compute metrics twice: once with the real visual prefix
-and once with a zeroed prefix (blind). If the model only memorized the question
-priors, the two scores are nearly identical — that is the signal this harness
-is designed to expose.
+For every example we generate a full answer twice: once with the real visual
+prefix and once with a zeroed prefix (blind). If the model only memorized the
+question priors, the two scores are nearly identical — that is the signal this
+harness is designed to expose.
 
 Usage::
 
@@ -22,17 +22,17 @@ import torch
 
 from data.collate import collate_fn
 from data.medical_vqa import VQAStream, SOURCES
-from data.tokenizer import get_encoder
+from data.tokenizer import EOT_TOKEN_ID, get_encoder
 from model.medical_vllm import MedicalVLLM
-from train.common import get_device, load_yaml, resolve_path, set_seed
+from train.common import get_device, resolve_path, set_seed
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def normalize(text: str) -> str:
-    text = text.lower().strip()
-    text = re.sub(r"^[ab]\.\s*", "", text)  # MCQ letter prefix
+    text = str(text).lower().strip()
+    text = re.sub(r"^[abcd]\.\s*", "", text)  # MCQ letter prefix
     text = text.translate(str.maketrans("", "", string.punctuation))
     return " ".join(text.split())
 
@@ -44,9 +44,38 @@ def f1_token(pred: str, ref: str) -> float:
     common = set(p) & set(r)
     if not common:
         return 0.0
-    prec = len(common) / len(p)
-    rec = len(common) / len(r)
+    prec, rec = len(common) / len(p), len(common) / len(r)
     return 2 * prec * rec / (prec + rec)
+
+
+@torch.no_grad()
+def _generate(
+    model: MedicalVLLM,
+    prefix: torch.Tensor,
+    ids: torch.Tensor,
+    max_new_tokens: int,
+) -> torch.Tensor:
+    """Cached greedy decoding with an explicit visual prefix."""
+    model.llm.reset_cache()
+    tok = torch.cat([prefix, model.llm.tok_emb(ids)], dim=1)
+    if tok.size(1) + max_new_tokens > model.llm.context_length:
+        raise ValueError("prefix + prompt + max_new_tokens exceeds context")
+    logits = model.llm.forward_embeds(tok, use_cache=True)[:, -1, :]
+    generated = ids
+    finished = torch.zeros(ids.size(0), dtype=torch.bool, device=ids.device)
+    for _ in range(max_new_tokens):
+        nxt = model.llm._sample_next(logits, 0.0, None)
+        nxt, finished, all_done = model.llm._apply_eos(
+            nxt, finished, EOT_TOKEN_ID
+        )
+        generated = torch.cat([generated, nxt], dim=1)
+        if all_done:
+            break
+        logits = model.llm.forward_embeds(
+            model.llm.tok_emb(nxt), use_cache=True
+        )[:, -1, :]
+    model.llm.reset_cache()
+    return generated
 
 
 @torch.no_grad()
@@ -56,6 +85,7 @@ def evaluate(
     n: int,
     device,
     blind: bool = False,
+    max_new_tokens: int = 24,
 ):
     model.eval()
     enc = get_encoder()
@@ -68,31 +98,25 @@ def evaluate(
             break
         if ex["pixel_values"] is None:
             continue
-        pixel = ex["pixel_values"].unsqueeze(0).to(device)
-        batch = collate_fn([ex])
-        ids = batch["input_ids"].to(device)
 
-        prefix_len = model.num_visual_tokens
+        ids = torch.tensor([ex["input_ids"]], dtype=torch.long, device=device)
         if blind:
-            # Replace the visual prefix with zeros without touching the tower.
-            vis = torch.zeros(
-                1, prefix_len, model.llm.tok_emb.embedding_dim,
-                device=device, dtype=model.llm.tok_emb.weight.dtype,
+            prefix = torch.zeros(
+                1,
+                model.num_visual_tokens,
+                model.llm.tok_emb.embedding_dim,
+                device=device,
+                dtype=model.llm.tok_emb.weight.dtype,
             )
-            tok = torch.cat([vis, model.llm.tok_emb(ids)], dim=1)
-            model.llm.reset_cache()
-            logits = model.llm.forward_embeds(tok, use_cache=True)[:, -1, :]
         else:
-            model.llm.reset_cache()
-            vis = model.encode_image(pixel)
-            tok = torch.cat([vis, model.llm.tok_emb(ids)], dim=1)
-            logits = model.llm.forward_embeds(tok, use_cache=True)[:, -1, :]
+            pixel = ex["pixel_values"].unsqueeze(0).to(device)
+            prefix = model.encode_image(pixel)
 
-        nxt = model.llm._sample_next(logits, 0.0, None)
-        pred = enc.decode([int(nxt[0, 0])]).strip()
-        # Reference = first non-masked target token sequence, decoded.
-        labels = ex["labels"]
-        ref_ids = [t for t in labels if t != -100]
+        gen = _generate(model, prefix, ids, max_new_tokens)
+        pred = enc.decode(gen[0, ids.size(1):].tolist()).strip()
+        ref_ids = [
+            t for t in ex["labels"] if t != -100 and t != EOT_TOKEN_ID
+        ]
         ref = enc.decode(ref_ids).strip()
         rows.append((pred, ref))
 
@@ -123,19 +147,28 @@ def main(argv=None):
     ).to(device)
     model.load(ckpt, load_connector=True)
     stream = VQAStream(
-        args.source, SOURCES[args.source][0],
-        budget=112, shuffle_buffer=0, train=False,
+        args.source,
+        SOURCES[args.source][0],
+        budget=112,
+        shuffle_buffer=0,
+        train=False,
     )
 
     real = evaluate(model, stream, args.samples, device, blind=False)
     blind = evaluate(model, stream, args.samples, device, blind=True)
     result = {
-        "checkpoint": str(ckpt), "source": args.source,
-        "real": real, "blind": blind,
+        "checkpoint": str(ckpt),
+        "source": args.source,
+        "real": real,
+        "blind": blind,
         "delta_exact": round(real["exact"] - blind["exact"], 4),
     }
     print(json.dumps(result, indent=2))
-    out = Path(args.out) if args.out else ROOT / "outs" / "eval" / f"{args.source}.json"
+    out = (
+        Path(args.out)
+        if args.out
+        else ROOT / "outs" / "eval" / f"{args.source}.json"
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")
 
