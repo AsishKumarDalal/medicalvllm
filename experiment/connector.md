@@ -14,6 +14,13 @@ See [vllm.md](vllm.md) for the full project plan.
 *Editable source: [`make_connector_diagram.py`](make_connector_diagram.py) —
 rerun `python experiment/make_connector_diagram.py` after design changes.*
 
+**Prior art:** this is the **Perceiver Resampler** from
+[Flamingo (Alayrac et al., 2022)](https://arxiv.org/abs/2204.14198),
+closely related to [BLIP-2's Q-Former](https://arxiv.org/abs/2301.12597).
+The same connector is used in the medical VLM
+[Med-Flamingo](https://arxiv.org/abs/2307.15189). Full citations, design-rule
+paper (PaLM2-VAdapter) and medical precedents: **[references.md](references.md)**.
+
 ---
 
 ## 1. Where the connector sits

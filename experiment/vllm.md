@@ -131,6 +131,12 @@ Resampler spec:
   so the prefix does not swamp the residual stream at step 0.
 - K configurable: 32 / 64 / 128 for ablation. Default 64.
 
+This connector is not novel: it is Flamingo's **Perceiver Resampler**
+(64 latent queries, frozen encoder) adapted to a 100M decoder; BLIP-2's
+Q-Former is the closest training-recipe analogue, and Med-Flamingo already
+uses it in the medical domain. Citations and positioning:
+**[references.md](references.md)**.
+
 ### 2.3 Decoder integration (soft prefix)
 
 Wrapper class `MedicalVLLM(nn.Module)` owns `vision`, `connector`, `llm`
