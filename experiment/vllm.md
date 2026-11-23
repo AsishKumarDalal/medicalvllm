@@ -344,6 +344,9 @@ the notebook must be able to run `medicalvllm` alone.
 
 ## 6. Implementation phases
 
+Coding contract (module interfaces, class design, the one `forward_embeds`
+change, commit order): **[code.md](code.md)**.
+
 | Phase | Deliverable | Files | Est. |
 | --- | --- | --- | --- |
 | **P0** | dataset id verification script + download smoke (10 samples each), throughput baseline | `data/*` stubs, `runbook/kaggle.md` | 1h |
