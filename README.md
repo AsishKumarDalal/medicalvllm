@@ -98,7 +98,7 @@ python -m train.align --steps 2   # watch a real training step happen
 | `model/` | vision tower, connector, MedicalVLLM wrapper, vendored minillm GPT |
 | `model/minillm/SYNC.md` | source commit + the single `forward_embeds` refactor |
 | `data/` | transforms, GPT-2 tokenizer, ROCOv2 + 4 VQA sources, text replay |
-| `train/` | Stage 1 (`train.align`) and Stage 2 (`train.vqa_sft`) loops |
+| `train/` | Stage 1 (`train.align`) and Stage 2 (`train.vqa_sft`) loops — see [`train/README.md`](train/README.md) for all params, flags and HF sync |
 | `eval/` | VQA benchmarks + blind baseline |
 | `code_test/` | GPU smoke tests on the real model + checkpoint-state tests |
 | `runbook/` | Kaggle session runbooks |
