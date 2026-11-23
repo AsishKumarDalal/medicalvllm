@@ -175,9 +175,25 @@ phase1:  43%|████▊ |, #1,876 | loss 4.463 | ppl 86.7 | 1.92M tok | 59.
 | `ep` | Approximate epoch (`examples_seen / epoch_size`) |
 | `gn` | Gradient L2 norm **before** clipping (`grad_clip: 1.0`) |
 
+### What the percentage measures
+
+Same priority in both trainers (first match wins):
+
+| Given | Bar percentage |
+| --- | --- |
+| `--steps N` | global step / N |
+| `--hours H` (no `--steps`) | elapsed seconds / (H × 3600) |
+| neither | dataset rows consumed / `data.epoch_size` (wraps each epoch) |
+
+The bar description shows which mode is active: `phase1`, `phase1 (time budget)`
+or `phase1 (rows)`. On resume, the starting percentage comes from the saved
+`step`, `elapsed_seconds` or `examples_seen`, so it never resets to 0.
+
 Full INFO lines print for the first 10 steps and every 100 after; the bar is
 the live display. Tune with `log_first_steps` and `log_interval` in the config.
-Log lines are written *above* the bar via `tqdm.write`.
+Log lines are written *above* the bar via `tqdm.write`. Per-request library
+chatter (`HTTP Request:`, `Resolving data files:`) is filtered at the handler
+level so it cannot interrupt the bar.
 
 ### Live samples
 
@@ -284,6 +300,13 @@ One repo (`hf.repo`), two folders (`hf.root` + `/phaseN/`):
 - `upload_checkpoint()` writes **both** `phase_N_latest.pt` and a numbered copy
   under `checkpoints/`.
 - `upload_outs()` uploads metrics JSON plus every `*.png` graph from `out_dir`.
+- Both happen together on a timer: every `hf_upload_interval_minutes` (default
+  **60**, i.e. hourly) the trainer regenerates the graphs, uploads the latest
+  checkpoint **and** `outs/` (metrics + `loss_vs_step.png` + `lr_vs_step.png`),
+  and logs `HF sync phase N: checkpoint=OK graphs/metrics=OK at step ...`.
+  It also runs once on the final save. Upload failures only warn — the local
+  checkpoint is already safely written. Set `hf_upload_interval_minutes` in
+  either config to change the cadence.
 - The 86M vision tower is never uploaded — only its name is in the checkpoint.
 
 ### Resume priority

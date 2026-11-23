@@ -181,6 +181,7 @@ class RunState:
     total_text_tokens: int = 0
     total_images_seen: int = 0
     epoch: float = 0.0
+    elapsed_seconds: float = 0.0
     resumed_from: str = "fresh"
 
     def update(
@@ -207,6 +208,9 @@ def restore_state(ckpt: dict, state: RunState) -> RunState:
     ):
         setattr(state, key, int(ckpt.get(key, getattr(state, key))))
     state.epoch = float(ckpt.get("epoch", state.epoch))
+    state.elapsed_seconds = float(
+        ckpt.get("elapsed_seconds", state.elapsed_seconds)
+    )
     state.resumed_from = str(ckpt.get("resumed_from", "checkpoint"))
     return state
 
@@ -443,6 +447,23 @@ def save_plots(out_dir: str | Path):
 
 
 # ---------------------------------------------------------- tqdm bars (minillm)
+class LibraryNoiseFilter(logging.Filter):
+    """Drop per-request library chatter that survives logger level changes.
+
+    Some bundled libraries attach their own handler and reset their logger
+    level on import, so setting WARNING alone is not enough. This filter is
+    installed on the root handler AND on the noisy loggers' own handlers.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not (
+            msg.startswith("HTTP Request:")
+            or msg.startswith("Resolving data files:")
+            or msg.startswith("Warning: You are sending unauthenticated")
+        )
+
+
 class TqdmLoggingHandler(logging.StreamHandler):
     """Print log lines ABOVE an active tqdm bar instead of through it."""
 
@@ -469,13 +490,19 @@ def setup_logging() -> None:
     handler.setFormatter(
         logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
     )
+    noise_filter = LibraryNoiseFilter()
+    handler.addFilter(noise_filter)
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     for name in (
         "httpx", "httpx2", "httpcore", "httpcore2",
         "urllib3", "requests", "datasets", "huggingface_hub",
         "huggingface_hub.utils._http", "fsspec", "numexpr",
     ):
-        logging.getLogger(name).setLevel(logging.WARNING)
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.WARNING)
+        lg.addFilter(noise_filter)
+        for h in lg.handlers:
+            h.addFilter(noise_filter)
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     # Xet opens background Rust threads for parquet range requests; at process
@@ -523,28 +550,42 @@ def style_progress_bar(pbar) -> None:
         pass
 
 
-def build_progress_bar(phase: int, max_steps, max_hours, state: RunState):
-    """minillm-style tqdm bar.
+def build_progress_bar(
+    phase: int,
+    max_steps,
+    max_hours,
+    state: RunState,
+    epoch_size: int = 0,
+):
+    """minillm-style tqdm bar with three mutually exclusive progress modes.
 
-    Percentage measures the **time budget** when ``--hours`` is given,
-    otherwise the **global step** budget. ``initial`` uses the resumed state so
-    a restarted run does not reset the bar to 0.
+    Priority (first match wins):
+
+    1. ``--steps`` given   → percent of the requested optimizer steps
+    2. ``--hours`` given   → percent of the wall-clock budget
+    3. neither given       → percent of dataset rows consumed
+                             (``examples_seen / data.epoch_size``)
+
+    ``initial`` and row progress come from the restored ``state`` so a restart
+    never resets the bar to zero.
     """
     if tqdm is None:
         return None
 
     if max_steps:
-        total = float(max_steps)
-        initial = min(total, float(state.step))
+        mode, total, initial = "steps", float(max_steps), float(state.step)
         unit, desc = "step", f"phase{phase}"
     elif max_hours:
+        mode = "hours"
         total = float(max_hours) * 3600.0
-        initial = min(total, max(0.0, 0.0))
+        initial = min(total, max(0.0, state.elapsed_seconds))
         unit, desc = "s", f"phase{phase} (time budget)"
     else:
-        total = None
-        initial = float(state.step)
-        unit, desc = "step", f"phase{phase}"
+        mode = "rows"
+        total = float(epoch_size) if epoch_size and epoch_size > 0 else None
+        # Wrap at one dataset pass so the bar fills once per epoch.
+        initial = float(state.examples_seen % epoch_size) if total else 0.0
+        unit, desc = "row", f"phase{phase} (rows)"
 
     pbar = tqdm(
         total=total,
@@ -552,25 +593,41 @@ def build_progress_bar(phase: int, max_steps, max_hours, state: RunState):
         desc=desc,
         unit=unit,
         # Fixed width: dynamic_ncols in a Kaggle output cell is detected as a
-        # tiny terminal, which clips the right-hand stats. 150 cols keeps the
-        # whole postfix visible; terminals wrap instead of cutting it.
+        # tiny terminal, which clips the right-hand stats.
         ncols=150,
         postfix="",
         colour="green",
-        # minillm's exact bar format: clean %, no awkward time values.
         bar_format="{desc}: {percentage:3.0f}%|{bar}|{postfix}",
     )
-    pbar._mv_time_based = bool(max_hours and not max_steps)
+    pbar._mv_mode = mode
+    pbar._mv_epoch_size = int(epoch_size)
     style_progress_bar(pbar)
     return pbar
 
 
-def progress_update(pbar, max_hours, elapsed_seconds: float):
-    """Advance the bar by time (if hour budget) or by one step."""
+def progress_update(
+    pbar,
+    n_rows: int = 0,
+    elapsed_seconds: float = 0.0,
+    examples_seen: int = 0,
+):
+    """Advance the bar according to its active mode."""
     if pbar is None:
         return
-    time_based = getattr(pbar, "_mv_time_based", False)
-    pbar.update(max(0.0, elapsed_seconds) if time_based else 1)
+    mode = getattr(pbar, "_mv_mode", "steps")
+    if mode == "hours":
+        pbar.update(max(0.0, elapsed_seconds))
+    elif mode == "rows":
+        epoch_size = getattr(pbar, "_mv_epoch_size", 0)
+        target = int(examples_seen % epoch_size) if epoch_size else int(n_rows)
+        delta = target - int(pbar.n)
+        if delta > 0:
+            pbar.update(delta)
+        elif delta < 0:            # new epoch started
+            pbar.n = 0
+            pbar.update(target)
+    else:
+        pbar.update(1)
 
 
 def show_sample_image(pixel, out_dir, step: int):

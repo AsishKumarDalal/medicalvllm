@@ -250,12 +250,17 @@ def main(argv=None):
     t0 = time.time()
     last_save = t0
     interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
+    hf_interval = float(
+        cfg.get("hf_upload_interval_minutes", interval / 60)
+    ) * 60
+    last_hf_upload = t0
     log_first = int(cfg.get("log_first_steps", 10))
     log_every = int(cfg.get("log_interval", 100))
     running, nloss, micro, halted = 0.0, 0, 0, False
     gn = 0.0
 
     def save(tag):
+        state.elapsed_seconds = time.time() - t0
         ckpt = build_checkpoint(
             base_model, state, optimizer, scheduler,
             {k: v.stats for k, v in streams.items()},
@@ -267,15 +272,26 @@ def main(argv=None):
         save_plots(out_dir)
         metrics.log(event="checkpoint", step=state.step,
                     text_tokens=state.total_text_tokens,
-                    images=state.total_images_seen)
+                    images=state.total_images_seen,
+                    elapsed_seconds=round(state.elapsed_seconds, 1))
         logger.info("saved phase-2 checkpoint at step %d", state.step)
-        if use_hf:
-            upload_checkpoint(hf_cfg, PHASE, step_path, state.step)
-            upload_outs(hf_cfg, PHASE, out_dir)
+        return step_path
+
+    def upload_to_hf(step_path):
+        if not use_hf:
+            return
+        save_plots(out_dir)   # regenerate graphs before uploading
+        ok_ckpt = upload_checkpoint(hf_cfg, PHASE, step_path, state.step)
+        ok_outs = upload_outs(hf_cfg, PHASE, out_dir)
+        logger.info(
+            "HF sync phase %d: checkpoint=%s graphs/metrics=%s at step %d",
+            PHASE, "OK" if ok_ckpt else "FAILED",
+            "OK" if ok_outs else "FAILED", state.step,
+        )
 
     logger.info("Stage 2 start: step=%d steps=%s hours=%s batch=%s accum=%s",
                 state.step, max_steps, max_hours, batch_size, accum)
-    pbar = build_progress_bar(PHASE, max_steps, max_hours, state)
+    pbar = build_progress_bar(PHASE, max_steps, max_hours, state, epoch_size)
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -319,7 +335,13 @@ def main(argv=None):
                 state.step += 1
                 avg = running / max(1, nloss)
                 running, nloss = 0.0, 0
-                progress_update(pbar, max_hours, time.time() - t0)
+                state.elapsed_seconds = time.time() - t0
+                progress_update(
+                    pbar,
+                    n_rows=len(examples),
+                    elapsed_seconds=state.elapsed_seconds,
+                    examples_seen=state.examples_seen,
+                )
                 if pbar is not None:
                     pbar.set_postfix_str(postfix(state, avg, gn))
                 if state.step <= log_first or state.step % log_every == 0:
@@ -357,8 +379,11 @@ def main(argv=None):
 
             now = time.time()
             if now - last_save >= interval:
-                save(f"step{state.step}")
+                step_path = save(f"step{state.step}")
                 last_save = now
+                if now - last_hf_upload >= hf_interval:
+                    upload_to_hf(step_path)
+                    last_hf_upload = now
     except (KeyboardInterrupt, StopIteration):
         halted = True
     finally:
@@ -369,14 +394,13 @@ def main(argv=None):
         if sample_stream is not None:
             sample_stream.close()
         shutdown_streaming_http()
-        save("final")
+        final_path = save("final")
         metrics.log(event="end", step=state.step, halted=halted,
                     hours=round((time.time() - t0) / 3600, 3),
                     total_text_tokens=state.total_text_tokens,
                     total_images_seen=state.total_images_seen)
-        save_plots(out_dir)
         if use_hf:
-            upload_outs(hf_cfg, PHASE, out_dir)
+            upload_to_hf(final_path)
         logger.info("Stage 2 done at step %d; stats=%s", state.step,
                     {k: v.stats for k, v in streams.items()})
     return state.step

@@ -123,6 +123,29 @@ def main():
     check("last_epoch advanced", sched4.last_epoch == 10)
     check("LR recomputed", abs(opt4.param_groups[0]["lr"] - 5e-4) < 1e-12)
 
+    print("\n== progress bar modes ==")
+    from train.common import build_progress_bar, progress_update
+    s2 = RunState(step=120, examples_seen=3000, elapsed_seconds=600)
+
+    b1 = build_progress_bar(1, 1000, None, s2, 130000)
+    check("steps mode", b1._mv_mode == "steps" and b1.total == 1000)
+    progress_update(b1)
+    check("steps advance", int(b1.n) == 121)
+    b1.close()
+
+    b2 = build_progress_bar(2, None, 4, s2, 200000)
+    check("hours mode", b2._mv_mode == "hours" and b2.total == 14400)
+    check("hours resume from elapsed", int(b2.n) == 600)
+    progress_update(b2, elapsed_seconds=2.0)
+    check("hours advance", int(b2.n) == 602)
+    b2.close()
+
+    b3 = build_progress_bar(1, None, None, s2, 130000)
+    check("rows mode", b3._mv_mode == "rows" and b3.total == 130000)
+    progress_update(b3, n_rows=16, examples_seen=3016)
+    check("rows advance", int(b3.n) == 3016)
+    b3.close()
+
     print("\nALL STATE TESTS PASSED")
 
 

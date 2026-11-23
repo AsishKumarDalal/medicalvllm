@@ -18,6 +18,16 @@ stats. Log lines are printed **above** the bar, not through it. Full INFO lines
 only for the first 10 steps and every 100 steps after; the bar is the live
 display. Configure with `log_first_steps` and `log_interval`.
 
+The **percentage** follows the same rule in both trainers:
+
+- `--steps N` → global step / N
+- `--hours H` → elapsed time / H (description: `phaseN (time budget)`)
+- neither → dataset rows consumed / `data.epoch_size`
+  (description: `phaseN (rows)`, wraps once per epoch)
+
+With `--hf`, the latest checkpoint and all `outs/` graphs are pushed to HF
+every `hf_upload_interval_minutes` (default 60) and once at the end.
+
 **Multi-GPU:** `num_gpus: 2` in each config (or `--num-gpus N`) wraps the model
 in `nn.DataParallel` when several GPUs are visible. Optimizer state, sampling,
 eval and checkpoints always use the unwrapped model, so weights are saved

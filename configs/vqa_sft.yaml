@@ -22,6 +22,7 @@ sample_temperature: 0.0
 sample_top_k: null
 eval: {every_steps: 1000, dev_samples: 200}
 checkpoint_interval_minutes: 60
+hf_upload_interval_minutes: 60     # push checkpoint + graphs to HF every hour
 checkpoint_dir: checkpoints/vqa
 out_dir: outs/vqa
 # --hf enables BOTH download (medical_vllm/phase2/phase_2_latest.pt) and upload.
