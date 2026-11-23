@@ -12,6 +12,7 @@ import os
 import random
 import signal
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -508,6 +509,11 @@ def setup_logging() -> None:
     # Xet opens background Rust threads for parquet range requests; at process
     # exit those threads hit closed file descriptors and retry for ~30 s.
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    # DataParallel gathers our scalar loss into a vector; we reduce it with
+    # .mean() before backward, so this torch warning is expected noise.
+    warnings.filterwarnings(
+        "ignore", message="Was asked to gather along dimension 0"
+    )
     try:
         from datasets import disable_progress_bars
         disable_progress_bars()
@@ -753,8 +759,8 @@ def postfix(
     # changing postfix width makes tqdm resize the green bar every step.
     text = (
         f"#{state.step:>6,} | loss {loss:>6.3f} | ppl {ppl:>7.1f} | "
-        f"{format_compact(state.total_text_tokens):>7} tok | "
-        f"{format_compact(state.total_images_seen):>7} img | "
+        f"{format_compact(state.total_text_tokens):>7} tokens | "
+        f"{format_compact(state.total_images_seen):>7} images | "
         f"ep {state.epoch:>5.2f} | gn {grad_norm:>5.2f}{extra}"
     )
-    return text.ljust(88)
+    return text.ljust(94)

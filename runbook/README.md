@@ -18,11 +18,12 @@ stats. Log lines are printed **above** the bar, not through it. Full INFO lines
 only for the first 10 steps and every 100 steps after; the bar is the live
 display. Configure with `log_first_steps` and `log_interval`.
 
-The **percentage** follows the same rule in both trainers:
+The **percentage** follows the same rule in both trainers, based on **CLI flags
+only** (YAML `hours` / `steps` are stop limits, not bar modes):
 
-- `--steps N` → global step / N
+- `--steps N` → global step / N (description: `phaseN`)
 - `--hours H` → elapsed time / H (description: `phaseN (time budget)`)
-- neither → dataset rows consumed / `data.epoch_size`
+- neither — e.g. `--no-hf` alone → dataset rows consumed / `data.epoch_size`
   (description: `phaseN (rows)`, wraps once per epoch)
 
 With `--hf`, the latest checkpoint and all `outs/` graphs are pushed to HF

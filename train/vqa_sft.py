@@ -191,6 +191,10 @@ def main(argv=None):
 
     max_steps = args.steps or cfg.get("steps")
     max_hours = args.hours or cfg.get("hours")
+    # Bar mode is chosen from CLI flags ONLY. Config hours/steps are stop
+    # limits; supplying no flag means "rows" mode, per the documented rule.
+    bar_steps = args.steps if args.steps is not None else None
+    bar_hours = args.hours if args.hours is not None else None
     total = max_steps or 10_000
     warmup = int(cfg.get("warmup_steps", 100))
     lr_fn = build_lr_lambda(warmup, total)
@@ -292,7 +296,7 @@ def main(argv=None):
 
     logger.info("Stage 2 start: step=%d steps=%s hours=%s batch=%s accum=%s",
                 state.step, max_steps, max_hours, batch_size, accum)
-    pbar = build_progress_bar(PHASE, max_steps, max_hours, state, epoch_size)
+    pbar = build_progress_bar(PHASE, bar_steps, bar_hours, state, epoch_size)
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:

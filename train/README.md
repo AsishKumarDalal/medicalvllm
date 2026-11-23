@@ -170,24 +170,28 @@ phase1:  43%|████▊ |, #1,876 | loss 4.463 | ppl 86.7 | 1.92M tok | 59.
 | `#step` | Global optimizer step (continues across phases) |
 | `loss` | Mean cross-entropy over the last accumulation window |
 | `ppl` | `exp(loss)` — perplexity |
-| `tok` | Total supervised text tokens seen |
-| `img` | Total images seen |
+| `tokens` | Total supervised answer tokens seen (updates every step, both stages) |
+| `images` | Total images seen (updates every step, both stages) |
 | `ep` | Approximate epoch (`examples_seen / epoch_size`) |
 | `gn` | Gradient L2 norm **before** clipping (`grad_clip: 1.0`) |
 
 ### What the percentage measures
 
-Same priority in both trainers (first match wins):
+Same priority in both trainers (first match wins). **Mode is decided by CLI
+flags only** — `hours`/`steps` inside the YAML are stop limits, they do not
+change the bar:
 
-| Given | Bar percentage |
+| CLI flag | Bar percentage |
 | --- | --- |
 | `--steps N` | global step / N |
 | `--hours H` (no `--steps`) | elapsed seconds / (H × 3600) |
-| neither | dataset rows consumed / `data.epoch_size` (wraps each epoch) |
+| neither (e.g. `--no-hf` alone) | dataset rows consumed / `data.epoch_size` (wraps each epoch) |
 
-The bar description shows which mode is active: `phase1`, `phase1 (time budget)`
-or `phase1 (rows)`. On resume, the starting percentage comes from the saved
-`step`, `elapsed_seconds` or `examples_seen`, so it never resets to 0.
+So `python -m train.vqa_sft --no-hf` shows **`phase2 (rows)`** even though
+`configs/vqa_sft.yaml` sets `hours: 8` for stopping. The bar description shows
+the active mode: `phase2`, `phase2 (time budget)` or `phase2 (rows)`. On resume,
+the starting percentage comes from the saved `step`, `elapsed_seconds` or
+`examples_seen`, so it never resets to 0.
 
 Full INFO lines print for the first 10 steps and every 100 after; the bar is
 the live display. Tune with `log_first_steps` and `log_interval` in the config.
