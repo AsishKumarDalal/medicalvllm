@@ -228,6 +228,8 @@ def main(argv=None):
             )
         else:
             logger.info("starting phase 1 from SFT weights at global step 0")
+    if state.examples_seen and epoch_size:
+        state.epoch = state.examples_seen / epoch_size  # keep bar/state in sync
 
     # DataParallel uses every visible GPU; keep an unwrapped handle for
     # state_dict, sampling and config access (avoids "module." key prefixes).

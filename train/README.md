@@ -386,3 +386,5 @@ WARNING in `setup_logging()` so the bar stays readable.
 | tower weights in checkpoint | Never happens — only encoder name is stored |
 | HF upload failed warning | Missing/invalid `HF_TOKEN`; local checkpoint still saved |
 | exit hangs with `Bad file descriptor` | Should be fixed by the shutdown drain; report if it recurs |
+| `HTTP Request:` spam / bar looks broken **in phase 2 only** | Fixed: `vqa_sft.py` now calls `setup_logging()` (it previously used a bare `basicConfig`, bypassing the noise filter and the tqdm-safe log handler) |
+| bar width jumps between renders | Fixed: postfix fields are fixed-width and seeded at bar creation, so every redraw is exactly 150 columns |

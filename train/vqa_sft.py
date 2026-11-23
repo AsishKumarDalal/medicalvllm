@@ -113,8 +113,7 @@ def main(argv=None):
         _detach()
         return
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)s %(message)s")
+    setup_logging()   # minillm-style bar + library-noise filter (same as align)
     set_seed(args.seed)
     base = Path(args.config).resolve().parents[1]
     cfg = load_yaml(args.config)
@@ -227,6 +226,8 @@ def main(argv=None):
                 state.step, state.total_text_tokens,
                 state.total_images_seen, n,
             )
+    if state.examples_seen and epoch_size:
+        state.epoch = state.examples_seen / epoch_size  # keep bar/state in sync
 
     base_model = model
     if len(gpu_ids) > 1:

@@ -595,7 +595,10 @@ def build_progress_bar(
         # Fixed width: dynamic_ncols in a Kaggle output cell is detected as a
         # tiny terminal, which clips the right-hand stats.
         ncols=150,
-        postfix="",
+        # Seed the postfix at creation so the first render already has the
+        # final width — otherwise tqdm draws a full-width empty bar first
+        # and a narrow bar after the first step ("inconsistent" bar).
+        postfix=postfix(state, 0.0, 0.0),
         colour="green",
         bar_format="{desc}: {percentage:3.0f}%|{bar}|{postfix}",
     )
@@ -746,9 +749,12 @@ def postfix(
 ) -> str:
     """Full minillm-style live status string (all stats, no truncation)."""
     ppl = math.exp(min(loss, 50.0)) if math.isfinite(loss) else float("nan")
-    return (
-        f"#{state.step:,} | loss {loss:.3f} | ppl {ppl:,.1f} | "
-        f"{format_compact(state.total_text_tokens)} tok | "
-        f"{format_compact(state.total_images_seen)} img | "
-        f"ep {state.epoch:.2f} | gn {grad_norm:.2f}{extra}"
+    # Fixed-width fields keep the bar length constant across redraws; a
+    # changing postfix width makes tqdm resize the green bar every step.
+    text = (
+        f"#{state.step:>6,} | loss {loss:>6.3f} | ppl {ppl:>7.1f} | "
+        f"{format_compact(state.total_text_tokens):>7} tok | "
+        f"{format_compact(state.total_images_seen):>7} img | "
+        f"ep {state.epoch:>5.2f} | gn {grad_norm:>5.2f}{extra}"
     )
+    return text.ljust(88)
