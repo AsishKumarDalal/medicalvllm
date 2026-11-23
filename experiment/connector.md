@@ -1,229 +1,249 @@
-# Connector architecture — Perceiver resampler
+# Connector architecture — explained simply
 
-Detailed design of the bridge between the frozen **BiomedCLIP ViT-B/16**
-(196 patch tokens × 768-d) and the **minillm GPT** (768-d token embeddings).
-See [vllm.md](vllm.md) for the full project plan.
+The connector is the **translator between the image encoder and the language
+model**. The image encoder produces 196 image vectors; the GPT cannot use them
+directly. The connector reads all 196 and writes **64 new vectors** that the
+GPT can read as if they were 64 extra words.
 
-- **Input:** `patches [B, 196, 768]` — patch tokens, CLS dropped
+See [vllm.md](vllm.md) for the full project plan and
+[references.md](references.md) for the papers this design comes from.
+
+- **Input:** `patches [B, 196, 768]` — 196 patch tokens, CLS dropped
 - **Output:** `visual_prefix [B, 64, 768]` — same width as minillm embeddings
 - **Trainable params:** **14.82M** (2 resampler blocks, 4× FFN)
 - **Trained in:** Stage 1 (LLM frozen) and Stage 2 (LLM unfrozen); tower always frozen
 
-![Connector architecture](connector_architecture.png)
-
-*Editable source: [`make_connector_diagram.py`](make_connector_diagram.py) —
-rerun `python experiment/make_connector_diagram.py` after design changes.*
-
-**Prior art:** this is the **Perceiver Resampler** from
-[Flamingo (Alayrac et al., 2022)](https://arxiv.org/abs/2204.14198),
-closely related to [BLIP-2's Q-Former](https://arxiv.org/abs/2301.12597).
-The same connector is used in the medical VLM
-[Med-Flamingo](https://arxiv.org/abs/2307.15189). Full citations, design-rule
-paper (PaLM2-VAdapter) and medical precedents: **[references.md](references.md)**.
-
 ---
 
-## 1. Where the connector sits
+## 0. The whole idea in one picture
 
 ```mermaid
 flowchart LR
-    IMG["Medical image<br/>B × 3 × 224 × 224"] --> TOWER["BiomedCLIP ViT-B/16<br/>frozen · fp16 · no_grad"]
-    TOWER --> CLS["CLS token<br/>dropped"]
-    TOWER --> PATCH["Patch tokens<br/>B × 196 × 768"]
-    PATCH --> CONN["Connector<br/>Perceiver resampler"]
-    Q["Learned queries<br/>64 × 768"] --> CONN
-    CONN --> PREFIX["Visual prefix<br/>B × 64 × 768"]
-
-    TXT["Token ids<br/>B × T"] --> EMB["tok_emb<br/>B × T × 768"]
-    PREFIX --> CAT["Concatenate on seq dim<br/>B × (64+T) × 768"]
-    EMB --> CAT
-    CAT --> POS["+ pos_emb[0 : 64+T]"]
-    POS --> GPT["minillm GPT<br/>9 blocks · causal"]
-    GPT --> LOGITS["Logits<br/>B × (64+T) × 50257"]
-
-    classDef frozen fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5,color:#444
-    classDef train fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    classDef data fill:#f5f5f5,stroke:#999,color:#333
-    class TOWER,CLS frozen
-    class CONN train
-    class IMG,PATCH,Q,PREFIX,TXT,EMB,CAT,POS,GPT,LOGITS data
+    IMG["Medical image"] --> ENC["Frozen vision encoder<br/>BiomedCLIP"]
+    ENC --> P["196 patch vectors<br/>each 768 numbers"]
+    P --> CONN["CONNECTOR<br/>reads 196 → writes 64"]
+    CONN --> V["64 visual vectors<br/>each 768 numbers"]
+    Q["Question text"] --> GPT["minillm GPT"]
+    V --> GPT
+    GPT --> A["Answer text"]
 ```
 
-The connector never changes token ids or vocabulary — it only manufactures
-`K = 64` vectors that occupy absolute positions `0..63`; text starts at
-position 64.
+Think of it as a **compressor with a purpose**:
+
+| Problem | Connector's answer |
+| --- | --- |
+| The encoder gives **196** vectors; the GPT was trained on sequences of word vectors | Output a fixed **64** vectors, short enough to fit the context |
+| Image vectors and word vectors are both 768-d, but they do **not** live in the same learned space | Learn a projection that writes into the GPT's embedding space |
+| We do not want to retrain the 86M image encoder | Keep the encoder frozen; only train the small connector |
 
 ---
 
-## 2. Connector internals
+## 1. What the 64 "queries" are
+
+The connector owns **64 learned vectors**, called queries. They start as
+random numbers and are trained. Each query behaves like a question asked of
+the image. For example, one query might end up reacting to lung regions,
+another to text labels, another to image borders — but nobody assigns these
+roles; they are learned from data.
 
 ```mermaid
-flowchart TB
-    P["patches<br/>B × 196 × 768"] --> LNKV0["ln_kv"]
-    LNKV0 --> KV0["K = V<br/>B × 196 × 768"]
-
-    Q0["queries<br/>64 × 768<br/>learned parameter"] --> EXP["expand over batch<br/>B × 64 × 768"]
-
-    EXP --> BLOCK1["Resampler block 1"]
-    KV0 --> BLOCK1
-    BLOCK1 --> BLOCK2["Resampler block 2"]
-    KV0 --> BLOCK2
-    BLOCK2 --> LNOUT["LayerNorm"]
-    LNOUT --> PROJ["Linear 768 → 768"]
-    PROJ --> GATE["× learnable gate<br/>init 0.1"]
-    GATE --> OUT["visual prefix<br/>B × 64 × 768"]
-
-    classDef params fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    classDef ops fill:#f8fafc,stroke:#64748b,color:#0f172a
-    class Q0,GATE params
-    class P,KV0,OUT ops
+flowchart TD
+    QQ["One query vector"] --> ATT["Compare it with all 196 patches<br/>compute one score per patch"]
+    PP["196 patch vectors"] --> ATT
+    ATT --> W["Softmax over the 196 scores<br/>→ weights that sum to 1"]
+    W --> SUM["Weighted average of the patches<br/>= one summary vector"]
 ```
 
-Note: K/V are projected from the same patch sequence for both blocks in this
-diagram; the reference implementation normalizes patches inside each block
-(`ln_kv` per block). Functionally equivalent, ~1.5K params difference.
+So one query produces **one summary vector**. With 64 queries, we get 64
+summary vectors:
+
+```mermaid
+flowchart LR
+    Q["64 queries"] --> R["resampler"]
+    P["196 patches"] --> R
+    R --> O["64 summaries"]
+```
+
+The comparison step is called **cross-attention**: the queries are the
+"questions" (Q), the patches are the "answers to look at" (K and V). It is
+called *cross* because Q comes from one source (queries) and K/V from another
+(patches).
 
 ---
 
-## 3. One resampler block (pre-norm residual)
+## 2. Step by step: one forward pass
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant IMG as Image
+    participant VIT as Frozen ViT
+    participant CON as Connector
+    participant GPT as GPT
+    participant OUT as Answer
+
+    IMG->>VIT: 224 x 224 pixels
+    VIT-->>CON: 196 patch vectors
+    Note over CON: start with 64 learned queries
+    CON->>CON: block 1: queries look at patches, then think (FFN)
+    CON->>CON: block 2: same again
+    CON->>CON: LayerNorm -> Linear -> multiply by gate
+    CON-->>GPT: 64 visual vectors
+    GPT->>GPT: prepend them to the question tokens
+    GPT-->>OUT: generated answer
+```
+
+In words:
+
+1. The image becomes **196 patch vectors** of 768 numbers each.
+2. Start with **64 blank query vectors** (the same 64 for every image; they
+   are parameters, not something computed from the image).
+3. **Block 1:** every query compares itself with all 196 patches, collects a
+   weighted summary, then passes it through a small feed-forward network.
+4. **Block 2:** repeat with the improved queries.
+5. **LayerNorm + Linear + gate:** map the 64 vectors into the GPT's embedding
+   space and scale them down so they do not drown the text at step 0.
+6. The GPT receives `[64 visual vectors | question tokens]` and generates the
+   answer.
+
+---
+
+## 3. Inside one block
 
 ```mermaid
 flowchart TB
-    Q["q<br/>B × 64 × 768"] --> LNQ["LayerNorm 768"]
-    KV["patch features<br/>B × 196 × 768"] --> LNKV["LayerNorm 768"]
+    Q["q<br/>B × 64 × 768"] --> LNQ["LayerNorm"]
+    KV["patches<br/>B × 196 × 768"] --> LNKV["LayerNorm"]
 
-    LNQ --> QP["Q projection<br/>768 → 768"]
-    LNKV --> KP["K projection<br/>768 → 768"]
-    LNKV --> VP["V projection<br/>768 → 768"]
+    LNQ --> QP["Q projection"]
+    LNKV --> KP["K projection"]
+    LNKV --> VP["V projection"]
 
-    QP --> ATTN["Scaled dot-product attention<br/>12 heads · head_dim 64<br/>no causal mask · over 196 patches"]
-    KP --> ATTN
-    VP --> ATTN
-    ATTN --> OP["Output projection<br/>768 → 768"]
+    QP --> ATT["cross-attention<br/>12 heads, head_dim 64<br/>no causal mask"]
+    KP --> ATT
+    VP --> ATT
+    ATT --> OP["output projection"]
     OP --> R1(("+"))
     Q --> R1
-    R1 --> H["h<br/>B × 64 × 768"]
+    R1 --> H["updated queries"]
 
-    H --> LNF["LayerNorm 768"]
+    H --> LNF["LayerNorm"]
     LNF --> F1["Linear 768 → 3072"]
     F1 --> GELU["GELU"]
     GELU --> F2["Linear 3072 → 768"]
     F2 --> R2(("+"))
     H --> R2
     R2 --> OUT["q′<br/>B × 64 × 768"]
-
-    classDef norm fill:#fef3c7,stroke:#d97706,color:#78350f
-    classDef attn fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
-    classDef ff fill:#dcfce7,stroke:#16a34a,color:#14532d
-    class LNQ,LNKV,LNF norm
-    class ATTN,Q,OP,KP,VP attn
-    class F1,F2,GELU ff
 ```
 
-Key properties:
+Why each piece exists:
 
-1. **Queries are independent** — every one of the 64 slots cross-attends to
-   the 196 patches; there is no self-attention among slots. Cheap, and
-   duplication is harmless at this scale.
-2. **No causal mask** — the image is fully visible; only the GPT is causal.
-3. **Pre-norm residual** — stable at LR 1e-4 with no warmup tricks beyond
-   the configured 200 steps.
-4. **Cross-attention shapes** — `Q: [B, 64, 768]`, `K/V: [B, 196, 768]`,
-   attention matrix `[B, 12, 64, 196]` (small: ~12K scores per image).
+| Piece | Plain meaning |
+| --- | --- |
+| **LayerNorm before attention** | Keeps the numbers in a stable range so training does not explode |
+| **Q / K / V projections** | Three learned linear maps that let queries and patches be compared and combined |
+| **12-head cross-attention** | 12 independent comparisons at once; each head can notice a different relation |
+| **Residual `+`** | Adds the old query back, so the new query only has to learn a *change* |
+| **FFN 768 → 3072 → 768** | "Think about" what the query just collected; 4× wider is standard Transformer practice |
+| **Second residual `+`** | Same stability trick |
+| **No causal mask** | The whole image is visible at once; causality only matters for text generation |
+
+The 64 queries do **not** attend to each other in this design. Each one
+independently reads the patches. This is cheaper and simpler; duplication
+between queries is possible but harmless at this scale.
 
 ---
 
-## 4. Exact tensor flow
+## 4. Shapes at each step
 
 ```mermaid
 flowchart LR
-    A["pixel_values<br/>B × 3 × 224 × 224"] --> B["ViT patch embed<br/>14 × 14 grid"]
-    B --> C["12 transformer blocks<br/>frozen"]
-    C --> D["final LayerNorm<br/>B × 197 × 768"]
-    D --> E["drop CLS<br/>B × 196 × 768"]
-    E --> F["resampler ×2<br/>B × 64 × 768"]
-    F --> G["gate × proj<br/>B × 64 × 768"]
-    G --> H["concat with tok_emb<br/>B × (64+T) × 768"]
-    H --> I["+ pos_emb<br/>positions 0..63+T"]
-    I --> J["GPT blocks 0..8<br/>causal"]
-    J --> K["final_norm + out_head<br/>B × (64+T) × 50257"]
-    K --> L["CE on answer tokens<br/>labels -100 elsewhere"]
+    A["image<br/>B × 3 × 224 × 224"] --> B["ViT patches<br/>B × 196 × 768"]
+    B --> C["block 1<br/>B × 196 × 768<br/>(K, V unchanged)"]
+    C --> D["block 2<br/>B × 64 × 768<br/>(queries updated)"]
+    D --> E["LayerNorm<br/>B × 64 × 768"]
+    E --> F["Linear + gate<br/>B × 64 × 768"]
+    F --> G["prepend to text<br/>B × (64 + T) × 768"]
+    G --> H["GPT<br/>logits B × (64 + T) × 50257"]
 
-    style C fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5
-    style F fill:#dbeafe,stroke:#2563eb
-    style G fill:#dbeafe,stroke:#2563eb
+    style B fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5
 ```
 
-Sequence budget with `context_length = 1024`:
-
-| Segment | Positions | Count |
+| Symbol | Meaning | Value here |
 | --- | --- | --- |
-| Visual prefix | `0 … 63` | 64 |
-| Prompt / question | `64 … 64+T-1` | up to ~800 |
-| Answer + EOT | after prompt | ~100–150 |
-| **Hard limit** | `0 … 1023` | 1024 |
+| `B` | batch size | 16–32 |
+| `196` | number of image patches | 14 × 14 grid at 224 px, patch size 16 |
+| `768` | hidden width everywhere | encoder width = GPT width |
+| `64` | number of visual tokens (K) | fixed; ablated at 32 / 128 |
+| `T` | number of text tokens | question + answer, ≤ 960 |
 
-If `64 + T + max_new_tokens > 1024`, image generation raises instead of
-silently sliding the window (which would drop the image).
+Sequence layout inside the GPT's 1024-position context:
+
+```text
+position:  0 ................ 63 | 64 ..................... 64+T-1
+content:   [ 64 visual vectors ] | [ question ... answer ... EOT ]
+labels:    [ -100, ignored     ] | [ -100 on prompt, loss on answer ]
+```
+
+The visual prefix is never supervised; cross-entropy ignores all 64 positions.
 
 ---
 
-## 5. Training / gradient flow
+## 5. Where it sits in the full model
+
+```mermaid
+flowchart LR
+    IMG["Medical image<br/>B × 3 × 224 × 224"] --> TOWER["BiomedCLIP ViT-B/16<br/>frozen · fp16 · no_grad"]
+    TOWER --> PATCH["Patch tokens<br/>B × 196 × 768"]
+    PATCH --> CONN["Connector<br/>Perceiver resampler"]
+    Q["Learned queries<br/>64 × 768"] --> CONN
+    CONN --> PREFIX["Visual prefix<br/>B × 64 × 768"]
+
+    TXT["Token ids<br/>B × T"] --> EMB["tok_emb<br/>B × T × 768"]
+    PREFIX --> CAT["concatenate<br/>B × (64+T) × 768"]
+    EMB --> CAT
+    CAT --> POS["+ absolute pos_emb<br/>positions 0 .. 63+T"]
+    POS --> GPT["minillm GPT<br/>9 blocks · causal"]
+    GPT --> LOGITS["Logits<br/>B × (64+T) × 50257"]
+
+    classDef frozen fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5,color:#444
+    classDef train fill:#dbeafe,stroke:#2563eb,color:#1e3a8a
+    classDef data fill:#f5f5f5,stroke:#999,color:#333
+    class TOWER frozen
+    class Q,CONN train
+    class IMG,PATCH,PREFIX,TXT,EMB,CAT,POS,GPT,LOGITS data
+```
+
+The connector does **not** change the vocabulary or add a special `<image>`
+token. It only creates 64 vectors that occupy positions `0..63`. That is why
+the old checkpoints, tokenizer and output head stay compatible.
+
+---
+
+## 6. Training: what learns when
 
 ```mermaid
 flowchart LR
     subgraph S1["Stage 1 — alignment"]
         direction LR
-        I1["image"] --> T1["ViT 🔒"] --> C1["connector 🔓"] --> L1["GPT 🔒"] --> O1["caption loss"]
+        I1["image"] --> T1["ViT frozen"] --> C1["connector trains"] --> L1["GPT frozen"] --> O1["caption loss"]
     end
 
     subgraph S2["Stage 2 — medical VQA SFT"]
         direction LR
-        I2["image"] --> T2["ViT 🔒"] --> C2["connector 🔓"] --> L2["GPT 🔓"] --> O2["answer loss"]
+        I2["image"] --> T2["ViT frozen"] --> C2["connector trains"] --> L2["GPT trains"] --> O2["answer loss"]
     end
-
-    classDef locked fill:#e8e8e8,stroke:#888,stroke-dasharray:5 5
-    classDef open fill:#dbeafe,stroke:#2563eb
-    class T1,T2,L1 locked
-    class C1,C2,L2 open
 ```
 
-| Stage | Tower | Connector | GPT | Purpose |
+| Stage | ViT | Connector | GPT | What it learns |
 | --- | --- | --- | --- | --- |
-| 1 | frozen | **train** | frozen | Learn to speak the decoder's embedding space |
-| 2 | frozen | **train** | **train** | Learn medical QA behavior on top of aligned prefix |
-| 3 (opt) | top 2 blocks | train | train | Visual specialization at LR 1e-6 |
+| 1 | frozen | **train** | frozen | How to write image information in the GPT's own embedding language |
+| 2 | frozen | **train** | **train** | How to answer medical questions using that visual information |
+| 3 (optional) | top 2 blocks | train | train | Visual specialization at a very low LR |
 
-The tower forward runs under `torch.no_grad()` in **all** stages, so it adds
-no activation memory for backward and no optimizer state.
-
----
-
-## 6. Forward pass (sequence)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant DL as DataLoader
-    participant VT as BiomedCLIP tower
-    participant CN as Connector
-    participant GPT as minillm GPT
-    participant LOSS as Loss
-
-    DL->>VT: pixel_values [B,3,224,224]
-    Note over VT: eval() · fp16 · no_grad
-    VT-->>CN: patch tokens [B,196,768]
-    CN->>CN: expand 64 learned queries [B,64,768]
-    CN->>CN: block 1: cross-attend → residual → FFN → residual
-    CN->>CN: block 2: cross-attend → residual → FFN → residual
-    CN->>CN: LayerNorm → Linear → × gate
-    CN-->>GPT: visual prefix [B,64,768]
-    DL->>GPT: input_ids [B,T], labels [B,T]
-    GPT->>GPT: tok_emb → concat → pos_emb → 9 blocks → out_head
-    GPT->>LOSS: logits [B,64+T,50257]
-    Note over LOSS: labels = [-100 × 64 | text labels]<br/>CE only on answer + EOT
-    LOSS-->>CN: gradients flow only into connector
-```
+Stage 1 is connector-only on purpose: if the GPT is also moving while the
+connector is random, the GPT unlearns its SFT behavior. Freeze the translator's
+target language first, then let both move.
 
 ---
 
@@ -244,13 +264,13 @@ sequenceDiagram
 | Output gate | scalar | 1 |
 | **Total connector** | | **14,820,097 (~14.8M)** |
 
-For comparison, the frozen tower is 86M and the decoder is 102.5M, so the
-connector is ~7.7% of the trainable stack in Stage 2 and the only trainable
-module in Stage 1 (AdamW state ≈ 178MB fp32).
+For scale: tower 86M (frozen), decoder 102.5M. In Stage 1 the connector is
+the only trainable module (AdamW state ≈ 178MB); in Stage 2 it is ~7.7% of the
+trainable stack.
 
 ---
 
-## 8. Reference implementation
+## 8. Reference code
 
 ```python
 class PerceiverResampler(nn.Module):
@@ -288,73 +308,78 @@ class PerceiverResampler(nn.Module):
         return self.gate * self.proj(self.ln_out(q))  # [B, 64, 768]
 ```
 
-Design details worth preserving:
+Why these details matter:
 
-- **Query init** `N(0, 0.02)` matches GPT-2-style init; large queries cause
-  early attention saturation.
-- **Gate init 0.1** keeps the prefix small relative to trained token
-  embeddings at step 0. The gate is a *learned scalar*, so Stage 1 can raise
-  it if the signal is useful.
-- **`need_weights=False`** avoids materializing the 12K-score matrix for
-  logging (attention weights are not used).
-- **Projection into 768-d is direct** — no bottleneck. A 256-d intermediate
-  is only worth it if connector memory ever matters, which it does not here.
-- **No dropout inside the connector** by default; Stage 2 GPT dropout (0.1)
-  already regularizes, and the connector sees each image once per epoch.
+- **Query init N(0, 0.02):** matches GPT-2-style init; large queries saturate
+  attention early.
+- **Gate init 0.1:** at step 0 the visual prefix is small compared with trained
+  token embeddings, so it cannot blow up the loss. The gate is learned, so
+  Stage 1 can raise it if the signal is useful.
+- **`need_weights=False`:** attention maps are not logged; skipping them saves
+  memory.
+- **Direct projection to 768:** no bottleneck needed; a 256-d intermediate only
+  matters if memory is tight, which it is not here.
 
 ---
 
-## 9. Alternative connector (ablation baseline)
+## 9. The simpler alternative (ablation baseline)
 
 ```mermaid
 flowchart LR
-    P["patches<br/>B × 196 × 768"] --> R["reshape to grid<br/>B × 768 × 14 × 14"]
-    R --> AP["2 × 2 average pool<br/>B × 768 × 7 × 7"]
-    AP --> FL["flatten + transpose<br/>B × 49 × 768"]
-    FL --> L1["Linear 768 → 768"]
-    L1 --> G["GELU"]
-    G --> L2["Linear 768 → 768"]
-    L2 --> O["visual tokens<br/>B × 49 × 768"]
-
-    classDef train fill:#dbeafe,stroke:#2563eb
-    class L1,L2 train
+    P["196 patches<br/>B × 196 × 768"] --> R["reshape to 14 × 14 grid"] --> AP["2 × 2 average pool<br/>→ 7 × 7 = 49 tokens"]
+    AP --> L1["Linear 768 → 768"] --> G["GELU"] --> L2["Linear 768 → 768"] --> O["49 visual vectors"]
 ```
 
 | | Perceiver (default) | Pooled MLP |
 | --- | --- | --- |
-| Visual tokens | 64, fixed | 49, tied to 14×14 grid |
+| Visual tokens | 64, fixed | 49, tied to the 14×14 grid |
 | Params | 14.82M | 1.18M |
 | Selection | learned queries choose regions | uniform 2×2 pooling |
-| Encoder swap | any patch count | needs grid reshape |
-| Role | main model | cheap baseline / sanity check |
+| Encoder swap | any patch count | needs a grid reshape |
+| Role | main model | cheap sanity baseline |
 
-Both write into the same 768-d space, so the GPT wrapper and data pipeline
-are identical — switch with `connector: perceiver | pooled_mlp` in
+Both write into 768-d space, so the GPT wrapper and data pipeline are
+identical — switch with `connector: perceiver | pooled_mlp` in
 `configs/vision.yaml`.
 
 ---
 
-## 10. Failure modes and guards
+## 10. Common failure modes
 
 | Failure | Symptom | Guard |
 | --- | --- | --- |
-| Prefix too loud at init | loss spikes / NaN in first 100 steps | gate 0.1 + connector-only Stage 1 |
-| Queries collapse to one vector | captions ignore details, low diversity | monitor pairwise cosine of queries; add diversity loss only if observed |
+| Prefix too loud at init | loss spike / NaN in first 100 steps | gate 0.1 + connector-only Stage 1 |
+| Queries collapse to one vector | captions ignore details, low diversity | monitor pairwise cosine of queries |
 | Patch features unnormalized | attention logits explode | `ln_kv` before every attention |
-| Connector overfits ROCO style | generic "radiograph shows…" captions | Stage 2 mix + 10% text replay; early stop on VQA dev |
-| Tower accidentally trained | VRAM jump, degraded encoder | `requires_grad_(False)` + `eval()` + `no_grad()` + test asserting bit-identical tower weights after a step |
-| Sequence overflow | image silently dropped | hard error when `K + T + max_new > context_length` |
+| Connector overfits ROCO caption style | generic "radiograph shows…" text | Stage 2 mix + 10% text replay |
+| Tower accidentally trained | VRAM jump, degraded encoder | `requires_grad_(False)` + `eval()` + `no_grad()` + weight-equality test |
+| Sequence overflow | image silently dropped | hard error when `64 + T + max_new > 1024` |
 
 ---
 
 ## 11. Tests specific to the connector
 
-Per `agent.md`, tiny CPU model + fake random tower, no HF downloads:
+Per `agent.md`: tiny CPU model + fake random tower, no HF downloads.
 
 1. output shape `[B, 64, 768]` for arbitrary `B`;
 2. gate scales output linearly (`gate=0` ⇒ zero prefix);
-3. gradients reach `queries`, `proj`, block params;
-4. frozen fake tower params are bit-identical after `backward()`;
-5. `K` is configurable (32 / 64 / 128) and output respects it;
-6. full wrapper: prefix positions have `labels == -100`;
-7. KV-cached generation with prefix matches uncached logits (≤ 1e-4).
+3. gradients reach `queries`, `proj`, and block parameters;
+4. frozen fake tower parameters are bit-identical after `backward()`;
+5. `K` is configurable (32 / 64 / 128) and the output respects it;
+6. full wrapper: the 64 prefix positions have `labels == -100`;
+7. KV-cached generation with a prefix matches uncached logits (≤ 1e-4).
+
+---
+
+## 12. Visual version and prior art
+
+![Connector architecture](connector_architecture.png)
+
+*Editable source: [`make_connector_diagram.py`](make_connector_diagram.py) —
+rerun `python experiment/make_connector_diagram.py` after design changes.*
+
+This is the **Perceiver Resampler** from
+[Flamingo](https://arxiv.org/abs/2204.14198), closely related to
+[BLIP-2's Q-Former](https://arxiv.org/abs/2301.12597), and already used in the
+medical VLM [Med-Flamingo](https://arxiv.org/abs/2307.15189). Full citations:
+**[references.md](references.md)**.
