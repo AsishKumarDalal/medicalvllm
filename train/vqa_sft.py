@@ -1,11 +1,17 @@
 """Stage 2: medical VQA SFT (connector + LLM train, vision frozen).
 
-Loads the aligned connector from Stage 1, unfreezes the GPT, and trains on a
-weighted mixture of PMC-VQA / PathVQA / SLAKE / VQA-RAD with 10% text replay.
-Run::
+Flags::
 
-    python -m train.vqa_sft --steps 500
-    python -m train.vqa_sft --hours 8 --detach
+    --hf      resume from / upload to HuggingFace (medical_vllm/phase2/)
+    --no-hf   never touch HuggingFace (local files only)
+    --new     random LLM weights; ignore all checkpoints; start at step 0
+
+When phase 2 starts from a phase-1 checkpoint it silently inherits the GLOBAL
+step, total text tokens, images seen and optimizer state; this hand-off is
+logged once at INFO level. Run::
+
+    python -m train.vqa_sft --steps 100
+    python -m train.vqa_sft --hours 8 --hf --detach
 """
 
 import argparse
@@ -17,38 +23,55 @@ import torch
 
 from .common import (
     Metrics,
+    RunState,
     StopSignal,
     atomic_torch_save,
+    build_checkpoint,
     build_lr_lambda,
     clip_grad_norm,
+    fast_forward_scheduler,
     get_device,
+    latest_local_checkpoint,
+    load_optimizer_state_named,
     load_yaml,
     move_batch,
     resolve_path,
+    restore_state,
+    save_plots,
     set_seed,
 )
+from .hf_sync import download_latest, upload_checkpoint, upload_outs
 from data.collate import collate_fn
 from data.medical_vqa import BatchMixSampler, build_vqa_streams
 from model.medical_vllm import MedicalVLLM
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
+PHASE = 2
 
 
-def build_model(cfg: dict, base: Path, device, llm_cfg: dict | None = None):
-    init = resolve_path(str(cfg.get("init_from", "")), base)
-    state = torch.load(init, map_location="cpu", weights_only=True)
+def build_model(cfg, base, device, llm_cfg=None):
+    """Build phase 2 from the checkpoint given by ``init_from`` (or --new)."""
+    state = torch.load(cfg["_init_from"], map_location="cpu", weights_only=True) \
+        if cfg.get("_init_from") else {}
     if llm_cfg is None:
-        llm_cfg = state.get("config", {}).get("llm") or load_yaml(
-            base / "configs" / "model.yaml"
-        )
-    vision_cfg = state.get("config", {}).get("vision") or load_yaml(
-        base / "configs" / "vision.yaml"
-    )
-    connector_cfg = state.get("config", {}).get("connector") or vision_cfg
+        if "config" in state:
+            llm_cfg = state["config"]["llm"]
+        elif "model_config" in state:
+            llm_cfg = state["model_config"]
+        else:
+            llm_cfg = load_yaml(base / "configs" / "model.yaml")
+
+    if "config" in state:
+        vision_cfg = state["config"]["vision"]
+        connector_cfg = state["config"].get("connector") or vision_cfg
+    else:
+        vision_cfg = load_yaml(base / "configs" / "vision.yaml")
+        connector_cfg = vision_cfg
 
     model = MedicalVLLM(llm_cfg, vision_cfg, connector_cfg).to(device)
-    model.load(init, load_connector=True, strict_llm=True, strict_connector=True)
+    if cfg.get("_init_from"):
+        model.load(cfg["_init_from"], load_connector=True, strict_llm=True)
     if bool(cfg.get("freeze_llm", False)):
         model.freeze_llm()
     else:
@@ -56,7 +79,7 @@ def build_model(cfg: dict, base: Path, device, llm_cfg: dict | None = None):
     model.vision.set_frozen(True)
     model.unfreeze_connector()
     model.connector.train()
-    return model, llm_cfg, vision_cfg, connector_cfg, init
+    return model, llm_cfg, vision_cfg, connector_cfg
 
 
 def main(argv=None):
@@ -68,6 +91,12 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stop", default=None)
     ap.add_argument("--detach", action="store_true")
+    ap.add_argument("--hf", action="store_true",
+                    help="resume from and upload to HuggingFace")
+    ap.add_argument("--no-hf", action="store_true",
+                    help="never read or write HuggingFace")
+    ap.add_argument("--new", action="store_true",
+                    help="random LLM weights; ignore all checkpoints; step 0")
     args = ap.parse_args(argv)
 
     if args.detach:
@@ -81,21 +110,55 @@ def main(argv=None):
     cfg = load_yaml(args.config)
     device = get_device(args.device)
     stop = StopSignal(args.stop or (base / ".stop_vqa"))
-    flush = stop.check()
 
-    model, llm_cfg, vision_cfg, connector_cfg, init = build_model(
+    use_hf = bool(args.hf) and not args.no_hf
+    hf_cfg = dict(cfg.get("hf") or {})
+    hf_cfg["enabled"] = use_hf
+    logger.info("HF sync %s", "ENABLED (--hf)" if use_hf else "DISABLED")
+
+    ckpt_dir = resolve_path(cfg.get("checkpoint_dir", "checkpoints/vqa"), base)
+    out_dir = resolve_path(cfg.get("out_dir", "outs/vqa"), base)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---------------------------------------------------------- resume source
+    resume = None
+    if not args.new:
+        if use_hf:
+            resume = download_latest(hf_cfg, PHASE, base / ".hf_cache")
+        if resume is None:
+            resume = latest_local_checkpoint(
+                ckpt_dir,
+                ("phase_2_latest.pt", "medicalvllm_vqa_*.pt"),
+            )
+        if resume is None:
+            init = resolve_path(str(cfg.get("init_from", "")), base)
+            if init.is_file():
+                resume = init
+                logger.info("no phase-2 checkpoint; continuing from phase 1: %s",
+                            init)
+            else:
+                logger.info("no checkpoint found; starting phase 2 from scratch")
+    if args.new:
+        logger.info("--new: random LLM weights, starting at step 0")
+    cfg["_init_from"] = None if args.new else str(resume) if resume else None
+
+    model, llm_cfg, vision_cfg, connector_cfg = build_model(
         cfg, base, device
     )
     counts = model.param_counts()
     logger.info("params (M): %s", {k: round(v / 1e6, 2) for k, v in counts.items()})
 
+    # ---------------------------------------------------------------- data
     budget = int(cfg["data"].get("max_seq_budget", 112))
     streams = build_vqa_streams(cfg["data"], budget=budget)
     weights = dict(cfg["data"].get("mix", {}))
     batch_size = int(cfg.get("batch_size", 8))
     accum = int(cfg.get("grad_accum_steps", 2))
     sampler = BatchMixSampler(streams, weights, batch_size, seed=args.seed)
+    epoch_size = int(cfg["data"].get("epoch_size", 200_000))
 
+    # ---------------------------------------------------------- optimization
     groups = [
         {"params": list(model.connector.parameters()),
          "lr": float(cfg.get("lr_connector", 5e-5))},
@@ -108,22 +171,36 @@ def main(argv=None):
     max_hours = args.hours or cfg.get("hours")
     total = max_steps or 10_000
     warmup = int(cfg.get("warmup_steps", 100))
-    sched_base = build_lr_lambda(warmup, total)
-    def lr_fn(step, mult=1.0):
-        return sched_base(step) * mult
-    sched_conn = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, [lambda s: lr_fn(s, 1.0), lambda s: lr_fn(s, 0.2)]
+    lr_fn = build_lr_lambda(warmup, total)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        [lambda s: lr_fn(s), lambda s: lr_fn(s) * 0.2],
     )
 
-    ckpt_dir = resolve_path(cfg.get("checkpoint_dir", "checkpoints/vqa"), base)
-    out_dir = resolve_path(cfg.get("out_dir", "outs/vqa"), base)
-    metrics = Metrics(out_dir)
-    t0 = time.time()
-    last_save = t0
-    interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
-    step, running, nloss, micro = 0, 0.0, 0, 0
-    halted = False
+    state = RunState(phase=PHASE)
+    if resume and not args.new:
+        saved = torch.load(resume, map_location="cpu", weights_only=True)
+        restore_state(saved, state)
+        n = load_optimizer_state_named(model, optimizer, saved.get("optimizer"))
+        fast_forward_scheduler(scheduler, state.step)
+        state.resumed_from = str(resume)
+        if int(saved.get("phase", 1)) == 1:
+            # One-time, low-key hand-off notice for phase 1 -> phase 2.
+            logger.info(
+                "phase-2 hand-off from phase 1 (global step continues): "
+                "step=%d text_tokens=%d images=%d optimizer_params=%d",
+                state.step, state.total_text_tokens,
+                state.total_images_seen, n,
+            )
+        else:
+            logger.info(
+                "resumed phase 2: step=%d text_tokens=%d images=%d "
+                "optimizer_params=%d",
+                state.step, state.total_text_tokens,
+                state.total_images_seen, n,
+            )
 
+    metrics = Metrics(out_dir)
     eval_cfg = cfg.get("eval") or {}
     eval_every = int(eval_cfg.get("every_steps", 0))
     dev_samples = int(eval_cfg.get("dev_samples", 100))
@@ -133,27 +210,31 @@ def main(argv=None):
         batch_size=1, seed=args.seed + 1,
     ))
 
-    def save(tag):
-        atomic_torch_save({
-            "format": "medicalvllm-v1",
-            "step": step,
-            "llm": model.llm.state_dict(),
-            "connector": model.connector.state_dict(),
-            "vision": {
-                "encoder": model.vision.encoder_name,
-                "encoder_backend": model.vision.backend,
-                "image_size": model.vision.image_size,
-                "num_visual_tokens": model.num_visual_tokens,
-            },
-            "config": {
-                "llm": llm_cfg, "vision": vision_cfg,
-                "connector": connector_cfg,
-            },
-        }, ckpt_dir / f"medicalvllm_vqa_{tag}.pt")
-        logger.info("saved checkpoint %s", ckpt_dir / f"medicalvllm_vqa_{tag}.pt")
+    t0 = time.time()
+    last_save = t0
+    interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
+    running, nloss, micro, halted = 0.0, 0, 0, False
 
-    logger.info("Stage 2 start: steps=%s hours=%s batch=%s accum=%s",
-                max_steps, max_hours, batch_size, accum)
+    def save(tag):
+        ckpt = build_checkpoint(
+            model, state, optimizer, scheduler,
+            {k: v.stats for k, v in streams.items()},
+            llm_cfg, vision_cfg, connector_cfg,
+        )
+        step_path = ckpt_dir / f"phase2_step{state.step:07d}.pt"
+        atomic_torch_save(ckpt, step_path)
+        atomic_torch_save(ckpt, ckpt_dir / "phase_2_latest.pt")
+        save_plots(out_dir)
+        metrics.log(event="checkpoint", step=state.step,
+                    text_tokens=state.total_text_tokens,
+                    images=state.total_images_seen)
+        logger.info("saved phase-2 checkpoint at step %d", state.step)
+        if use_hf:
+            upload_checkpoint(hf_cfg, PHASE, step_path, state.step)
+            upload_outs(hf_cfg, PHASE, out_dir)
+
+    logger.info("Stage 2 start: step=%d steps=%s hours=%s batch=%s accum=%s",
+                state.step, max_steps, max_hours, batch_size, accum)
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -161,7 +242,7 @@ def main(argv=None):
             if stop.check():
                 halted = True
                 break
-            if max_steps and step >= max_steps:
+            if max_steps and state.step >= max_steps:
                 break
             if max_hours and (time.time() - t0) / 3600 >= max_hours:
                 halted = True
@@ -180,43 +261,63 @@ def main(argv=None):
             nloss += 1
             micro += 1
 
+            n_tokens = int((batch["labels"] != -100).sum())
+            n_imgs = (
+                0 if batch["pixel_values"] is None
+                else batch["pixel_values"].size(0)
+            )
+            state.update(len(examples), n_tokens, n_imgs, epoch_size)
+
             if micro % accum == 0:
                 gn = clip_grad_norm(model, float(cfg.get("grad_clip", 1.0)))
                 optimizer.step()
-                sched_conn.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-                step += 1
+                state.step += 1
                 avg = running / max(1, nloss)
                 running, nloss = 0.0, 0
-                if step % 10 == 0:
-                    logger.info("step %d loss %.4f lr_c %.2e lr_l %.2e gn %.3f",
-                                step, avg,
-                                optimizer.param_groups[0]["lr"],
-                                optimizer.param_groups[1]["lr"], gn)
-                    metrics.log(step=step, loss=round(avg, 5), source=source,
-                                lr_connector=optimizer.param_groups[0]["lr"],
-                                lr_llm=optimizer.param_groups[1]["lr"],
-                                grad_norm=round(gn, 4))
+                if state.step % 10 == 0:
+                    logger.info(
+                        "step %d loss %.4f lr_c %.2e lr_l %.2e | tok %d img %d",
+                        state.step, avg,
+                        optimizer.param_groups[0]["lr"],
+                        optimizer.param_groups[1]["lr"],
+                        state.total_text_tokens, state.total_images_seen,
+                    )
+                    metrics.log(
+                        step=state.step, loss=round(avg, 5), source=source,
+                        lr_connector=optimizer.param_groups[0]["lr"],
+                        lr_llm=optimizer.param_groups[1]["lr"],
+                        grad_norm=round(gn, 4),
+                        total_text_tokens=state.total_text_tokens,
+                        total_images_seen=state.total_images_seen,
+                        epoch=round(state.epoch, 4),
+                    )
 
-            if eval_every and step and step % eval_every == 0:
+            if eval_every and state.step and state.step % eval_every == 0:
                 score = _quick_eval(model, dev_iter, dev_samples, device)
-                metrics.log(step=step, eval_loss=round(score, 5))
+                metrics.log(step=state.step, eval_loss=round(score, 5))
                 logger.info("eval loss %.4f", score)
                 model.train()
 
             now = time.time()
             if now - last_save >= interval:
-                save(f"step{step}")
+                save(f"step{state.step}")
                 last_save = now
     except (KeyboardInterrupt, StopIteration):
         halted = True
     finally:
         save("final")
-        metrics.log(event="end", step=step, halted=halted,
-                    hours=round((time.time() - t0) / 3600, 3))
-        logger.info("Stage 2 done at step %d; stats=%s", step,
+        metrics.log(event="end", step=state.step, halted=halted,
+                    hours=round((time.time() - t0) / 3600, 3),
+                    total_text_tokens=state.total_text_tokens,
+                    total_images_seen=state.total_images_seen)
+        save_plots(out_dir)
+        if use_hf:
+            upload_outs(hf_cfg, PHASE, out_dir)
+        logger.info("Stage 2 done at step %d; stats=%s", state.step,
                     {k: v.stats for k, v in streams.items()})
-    return step
+    return state.step
 
 
 @torch.no_grad()

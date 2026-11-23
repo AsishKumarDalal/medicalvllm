@@ -1,9 +1,10 @@
 # configs/vqa_sft.yaml — Stage 2: medical VQA instruction tuning (connector + LLM)
-init_from: /kaggle/temp/medicalvllm/align/medicalvllm_align_final.pt
+init_from: /kaggle/temp/medicalvllm/align/phase_1_latest.pt   # phase-1 hand-off if no local phase-2 ckpt
 data:
   mix: {pmc_vqa: 0.55, path_vqa: 0.20, slake: 0.10, vqa_rad: 0.05, text_replay: 0.10}
   max_seq_budget: 112          # context_length 128 - K 16
   shuffle_buffer: 1000
+  epoch_size: 200000           # approximate mixed-dataset size (epoch reporting)
 freeze_llm: false
 lora: {enabled: false, r: 16, alpha: 32}
 lr_llm: 1.0e-5
@@ -18,4 +19,9 @@ eval: {every_steps: 1000, dev_samples: 200}
 checkpoint_interval_minutes: 60
 checkpoint_dir: checkpoints/vqa
 out_dir: outs/vqa
-hf: {enabled: false, filename: medicalvllm_latest.pt}
+# --hf enables BOTH download (medical_vllm/phase2/phase_2_latest.pt) and upload.
+# --no-hf, or omitting --hf, disables both. CLI always overrides `enabled`.
+hf:
+  enabled: false
+  repo: AsishKumarDalal/medicalvllm   # same repo; phase2/ folder
+  root: medical_vllm

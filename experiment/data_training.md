@@ -227,17 +227,41 @@ positions. The image contributes only as 16 extra input vectors.
 
 ```python
 {
-  "format": "medicalvllm-v1",
-  "step": ...,
+  "format": "medicalvllm-v2",
+  "phase": 1 or 2,
+  "step": ...,                    # GLOBAL across phases
+  "epoch": ...,                   # examples_seen / epoch_size
+  "examples_seen": ...,
+  "total_text_tokens": ...,       # supervised (answer) tokens seen
+  "total_images_seen": ...,
+  "resumed_from": "...",
   "llm": GPT state_dict,          # unprefixed keys → loads into inner GPT
   "connector": connector state_dict,
+  "optimizer": {...},             # keyed by param NAME, not tensor object
+  "scheduler": {...},
   "vision": {"encoder": name, ...},  # name ONLY — 86M tower never saved
   "config": {"llm": ..., "vision": ..., "connector": ...},
+  "stream_stats": {...},
 }
 ```
 
-The tower is rebuilt from its HF name at load time. That's why checkpoints are
-~470 MB (the GPT dominates) rather than ~800 MB.
+Optimizer state is keyed by **parameter name** so it can be reloaded into a
+fresh model instance, and so Phase 1's connector-only optimizer can hand its
+state to Phase 2's connector+LLM optimizer (LLM params start fresh). The tower
+is rebuilt from its HF name at load time. Checkpoints are ~590 MB (GPT +
+optimizer) rather than ~800 MB (no tower).
+
+### Flags and HF sync
+
+- no flag → local resume only, no HF read/write
+- `--hf` → resume from and upload to `medical_vllm/phaseN/` in the HF repo;
+  uploads `phase_N_latest.pt`, `checkpoints/phase_N_step*.pt`, and `outs/` with
+  `metrics.json` + `loss_vs_step.png` + `lr_vs_step.png`
+- `--no-hf` → explicitly disable HF even if config enables it
+- `--new` → random LLM weights, ignore all checkpoints, global step 0
+
+`step` is global: if Phase 1 ended at 10,000 then Phase 2 starts at 10,000 with
+the same token/image counters. Nothing is uploaded without `--hf`.
 
 ---
 

@@ -37,10 +37,18 @@ The code is agnostic to these numbers; they come from the checkpoint config.
 ```bash
 pip install -q open_clip_torch tiktoken         # once
 python -m code_test.test_all                     # ~2 min, real GPT + real tower
+python -m code_test.test_state                   # checkpoint/optimizer state tests
 python -m train.align --steps 200                # Stage 1 smoke run
 python -m train.vqa_sft --steps 100              # Stage 2 (needs align checkpoint)
 python -m eval.vqa_eval --checkpoint <ckpt> --source vqa_rad --samples 200
 ```
+
+**Resume / HF flags** (both trainers): no flag = local-only, `--hf` = resume
+from and upload to `medical_vllm/phaseN/` on HF, `--no-hf` = explicitly disable
+HF, `--new` = random LLM weights / global step 0. Nothing is uploaded unless
+`--hf` is passed. `step` is global across phases — Phase 2 continues from
+Phase 1's step, token count, image count and optimizer state. See the
+[runbook](runbook/README.md) for the full layout.
 
 The SFT checkpoint is resolved from `configs/align.yaml`: local path first,
 then `hf_fallback` (`sddfhy546y/minillm:sft_model.pt`). The 86M vision tower is
@@ -92,7 +100,7 @@ python -m train.align --steps 2   # watch a real training step happen
 | `data/` | transforms, GPT-2 tokenizer, ROCOv2 + 4 VQA sources, text replay |
 | `train/` | Stage 1 (`train.align`) and Stage 2 (`train.vqa_sft`) loops |
 | `eval/` | VQA benchmarks + blind baseline |
-| `code_test/` | GPU smoke tests on the real model |
+| `code_test/` | GPU smoke tests on the real model + checkpoint-state tests |
 | `runbook/` | Kaggle session runbooks |
 
 ## Secrets

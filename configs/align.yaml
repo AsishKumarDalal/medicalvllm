@@ -7,6 +7,7 @@ data:
   shuffle_buffer: 500
   max_text_tokens: 112
   max_image_size: 512
+  epoch_size: 130000              # ROCOv2 train rows (for approximate epoch count)
 freeze_llm: true
 batch_size: 16
 grad_accum_steps: 2
@@ -18,4 +19,9 @@ grad_clip: 1.0
 checkpoint_interval_minutes: 60
 checkpoint_dir: /kaggle/temp/medicalvllm/align
 out_dir: /kaggle/temp/medicalvllm/outs/align
-hf: {enabled: false}
+# --hf enables BOTH download (medical_vllm/phase1/phase_1_latest.pt) and upload.
+# --no-hf, or omitting --hf, disables both. CLI always overrides `enabled`.
+hf:
+  enabled: false
+  repo: AsishKumarDalal/medicalvllm   # HF model repo; set HF_TOKEN to upload
+  root: medical_vllm                  # folder inside the repo; phase1/ added

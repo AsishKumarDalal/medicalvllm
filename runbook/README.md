@@ -3,6 +3,47 @@
 Environment verified on Kaggle: 2× Tesla T4 (15 GB), torch 2.11+cu130,
 transformers 5.20, datasets 4.8, open_clip 4.2 (pip-installed).
 
+## Flags (both stages)
+
+| Flag | Effect |
+| --- | --- |
+| *(none)* | local resume only, **no HF read or write** |
+| `--hf` | resume from `medical_vllm/phaseN/phase_N_latest.pt` on HF **and** upload checkpoints + `outs/` graphs after every save |
+| `--no-hf` | explicitly disable HF even if the config enables it |
+| `--new` | random LLM weights, ignore every checkpoint, start at global step 0 |
+
+**Nothing is uploaded unless `--hf` is passed.** Set `HF_TOKEN` in Kaggle
+Secrets for upload to work; a failed upload only warns, it never kills training.
+
+`step` is **global**: Phase 2 continues from the step Phase 1 reached, carrying
+`total_text_tokens`, `total_images_seen`, `epoch`, and the optimizer state. The
+phase-1 → phase-2 hand-off is logged once at INFO level.
+
+Local files written per phase:
+
+```
+checkpoint_dir/
+  phase_1_latest.pt          (or phase_2_latest.pt)
+  phase1_step000010000.pt    (or phase2_step...)
+out_dir/
+  metrics.json / metrics.jsonl
+  loss_vs_step.png
+  lr_vs_step.png
+```
+
+HF repo layout (single repo, one folder per phase):
+
+```
+<repo>/medical_vllm/phase1/
+    phase_1_latest.pt
+    checkpoints/phase_1_step000010000.pt
+    outs/metrics.json, loss_vs_step.png, ...
+<repo>/medical_vllm/phase2/
+    phase_2_latest.pt
+    checkpoints/...
+    outs/...
+```
+
 ## 0. One-time setup
 
 ```python
@@ -20,8 +61,10 @@ Expected: all tests PASS, ~2 min after the 410 MB SFT checkpoint is cached.
 ## 1. Stage 1 — connector alignment
 
 ```bash
-python -m train.align --steps 4                # smoke test
+python -m train.align --steps 4                # smoke test, local only
 python -m train.align --hours 4 --detach       # real run, detached
+python -m train.align --hours 4 --hf --detach  # + HF resume/upload
+python -m train.align --hours 4 --new          # fresh random LLM, step 0
 ```
 
 - Checkpoint: `/kaggle/temp/medicalvllm/align/medicalvllm_align_final.pt`
@@ -38,6 +81,8 @@ Point `configs/vqa_sft.yaml:init_from` at the Stage 1 final checkpoint, then:
 ```bash
 python -m train.vqa_sft --steps 100             # smoke test
 python -m train.vqa_sft --hours 8 --detach      # real run
+python -m train.vqa_sft --hours 8 --hf --detach # + HF resume/upload
+python -m train.vqa_sft --hours 8 --new         # fresh random LLM, step 0
 ```
 
 - Checkpoint: `checkpoints/vqa/medicalvllm_vqa_final.pt`
