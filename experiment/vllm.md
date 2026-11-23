@@ -67,7 +67,7 @@ Consequences of these facts:
                                 │  no_grad, eval()
                                 ▼
                  ┌────────────────────────────┐
-                 │  Connector: Perceiver      │  TRAINABLE (~7M)
+                 │  Connector: Perceiver      │  TRAINABLE (~14.8M)
                  │  resampler, K=64 learned   │
                  │  queries, 2 cross-attn     │──► visual prefix [B, 64, 768]
                  │  layers + LN + MLP proj    │
@@ -111,11 +111,14 @@ Consequences of these facts:
 
 ### 2.2 Connector — Perceiver resampler (K = 64)
 
+Full connector architecture, tensor shapes, parameter table and Mermaid
+diagrams: **[connector.md](connector.md)**.
+
 Two candidates, resampler is the default:
 
 | Option | Params | Pros | Cons |
 | --- | --- | --- | --- |
-| **Perceiver resampler** (default) | ~7M | fixed K regardless of encoder patch count; encoder-agnostic ablations; strong at 100M-decoder scale (Flamingo-style) | more code, slightly slower |
+| **Perceiver resampler** (default) | ~14.8M | fixed K regardless of encoder patch count; encoder-agnostic ablations; strong at 100M-decoder scale (Flamingo-style) | more code, slightly slower |
 | Pooled MLP projector (LLaVA-1.5 style, 2×2 avg-pool → 49 tokens → 2-layer MLP) | ~2.4M | simplest possible baseline | K tied to patch grid; less compression control |
 
 Resampler spec:
@@ -158,10 +161,10 @@ wrapper adds a thin embedding-injection path:
 | Component | Params | Stage 1 | Stage 2 | Stage 3 (opt) |
 | --- | --- | --- | --- | --- |
 | BiomedCLIP ViT-B/16 | 86M | frozen | frozen | top 2 blocks unfrozen (~14M) |
-| Connector (K=64, 2 layers) | ~7M | **train** | **train** | train |
+| Connector (K=64, 2 layers) | ~14.8M | **train** | **train** | train |
 | minillm GPT | 102.5M | frozen | **train** | train |
 
-Stage 1 optimizer state ≈ 7M × 12 bytes ≈ 84MB. Stage 2 ≈ 110M × 12 ≈ 1.3GB
+Stage 1 optimizer state ≈ 14.8M × 12 bytes ≈ 178MB. Stage 2 ≈ 117M × 12 ≈ 1.4GB
 (fp32 AdamW) — both fit easily on one T4 next to activations.
 
 ## 3. Data plan — medical datasets
@@ -246,7 +249,7 @@ labels: -100 × 64     -100 (prompt)                                            
 | Setting | Value |
 | --- | --- |
 | Data | ROCOv2 radiology captions, streamed |
-| Trainable | connector (~7M) only |
+| Trainable | connector (~14.8M) only |
 | LR | 1e-4, cosine, warmup 200 steps |
 | Batch | 32 × grad_accum 2 (effective 64) |
 | Steps | ~2 epochs ≈ 4k steps (or `--hours 4` cap) |
@@ -510,7 +513,7 @@ env/Kaggle Secrets.
 
 | Item | Estimate |
 | --- | --- |
-| VRAM Stage 1 | tower fp16 0.35GB + frozen LLM 0.41GB + connector+Adam ~0.1GB + activations (B32, K64+~60 tok) ~2GB → **< 4GB**, single T4 |
+| VRAM Stage 1 | tower fp16 0.35GB + frozen LLM 0.41GB + connector+Adam ~0.2GB + activations (B32, K64+~60 tok) ~2GB → **< 4GB**, single T4 |
 | VRAM Stage 2 | + LLM grads/Adam 1.2GB + activations (B16, ~250 tok) ~4GB → **~7GB**, single T4; DDP 2×T4 halves wall time |
 | Throughput | tower ~300 img/s fp16 per T4; expect ~2–4 steps/s Stage 1, ~1–2 steps/s Stage 2 |
 | Stage 1 wall | 4k steps ≈ 1–2h (cap 4h) |

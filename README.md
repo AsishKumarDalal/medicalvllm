@@ -28,6 +28,7 @@ Scaffolding + plan. Implementation follows phases P0–P7 in the plan.
 | Path | Purpose |
 | --- | --- |
 | `experiment/vllm.md` | the plan (source of truth) |
+| `experiment/connector.md` | connector architecture in detail (Mermaid diagrams) |
 | `configs/` | model / vision / align / vqa_sft configs |
 | `model/` | vision tower, connector, MedicalVLLM wrapper, vendored minillm GPT |
 | `data/` | medical dataset loaders, transforms, dedup |
