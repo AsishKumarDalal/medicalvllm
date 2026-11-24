@@ -8,7 +8,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .connector import build_connector
-from .minillm.model import GPT, EOT_TOKEN_ID
+from .minillm.model import GPT, EOT_TOKEN_ID as GPT2_EOT_TOKEN_ID
+from .qwen_llm import QwenLLM
 from .vision_encoder import VisionTower
 
 
@@ -32,11 +33,34 @@ class MedicalVLLM(nn.Module):
         self.vision_cfg = dict(vision_cfg)
         self.connector_cfg = dict(connector_cfg or vision_cfg)
 
-        self.llm = GPT(llm_cfg)
+        self.backend = str(llm_cfg.get("backend", "gpt2")).lower()
+        if self.backend == "qwen":
+            self.llm = QwenLLM(llm_cfg)
+            dim = self.llm.hidden_size
+            # Token ids come from the active tokenizer backend (set by the
+            # trainer via --qwen before the model is built).
+            from data.tokenizer import get_eot_id, get_pad_id
+
+            default_eot, default_pad = get_eot_id(), get_pad_id()
+        elif self.backend in {"gpt2", "minillm"}:
+            self.llm = GPT(llm_cfg)
+            dim = int(llm_cfg["emb_dim"])
+            default_eot = default_pad = GPT2_EOT_TOKEN_ID
+        else:
+            raise ValueError(f"unknown LLM backend: {self.backend!r}")
+
+        self.eot_id = int(llm_cfg.get("eot_token_id", default_eot))
+        self.pad_id = int(llm_cfg.get("pad_token_id", default_pad))
+
         self.vision = VisionTower(vision_cfg)
         self.connector = build_connector(
-            self.connector_cfg, dim=int(llm_cfg["emb_dim"])
+            self.connector_cfg, dim=dim, in_dim=self.vision.width
         )
+        # The visual prefix is concatenated with the LLM's token embeddings,
+        # so the connector must produce exactly the same dtype (fp16 when the
+        # Qwen decoder is loaded in fp16). The vision tower stays fp32.
+        self.llm_dtype = self.llm.tok_emb.weight.dtype
+        self.connector.to(dtype=self.llm_dtype)
         self.num_visual_tokens = int(self.connector.num_queries)
 
         if int(vision_cfg.get("num_visual_tokens", self.num_visual_tokens)) != (
@@ -51,6 +75,7 @@ class MedicalVLLM(nn.Module):
         """Frozen tower (no grad) + trainable connector -> [B, K, dim]."""
         with torch.no_grad():
             patches = self.vision(pixel_values)
+        patches = patches.to(dtype=self.llm_dtype)
         if patches.size(1) != self.vision.num_patches:
             raise RuntimeError(
                 f"expected {self.vision.num_patches} patches, got "
@@ -92,7 +117,7 @@ class MedicalVLLM(nn.Module):
         max_new_tokens: int = 128,
         temperature: float = 0.0,
         top_k: int | None = None,
-        eos_id: int = EOT_TOKEN_ID,
+        eos_id: int | None = None,
     ) -> torch.Tensor:
         """Generate text conditioned on an optional image.
 
@@ -101,6 +126,8 @@ class MedicalVLLM(nn.Module):
         unlike text-only generation we must never slide the window and drop
         the image.
         """
+        if eos_id is None:
+            eos_id = self.eot_id
         if input_ids.dim() != 2:
             raise ValueError("input_ids must be (batch, seq)")
         if max_new_tokens < 0:
@@ -189,6 +216,10 @@ class MedicalVLLM(nn.Module):
     def save(self, path: str | Path, step: int = 0, extra: dict | None = None):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+        llm_cfg = dict(self.llm_cfg)
+        llm_cfg["backend"] = self.backend
+        llm_cfg["eot_token_id"] = self.eot_id
+        llm_cfg["pad_token_id"] = self.pad_id
         state = {
             "format": "medicalvllm-v1",
             "step": int(step),
@@ -201,7 +232,7 @@ class MedicalVLLM(nn.Module):
                 "num_visual_tokens": self.num_visual_tokens,
             },
             "config": {
-                "llm": self.llm_cfg,
+                "llm": llm_cfg,
                 "vision": self.vision_cfg,
                 "connector": self.connector_cfg,
             },
@@ -221,6 +252,13 @@ class MedicalVLLM(nn.Module):
     ) -> dict:
         """Load a MedicalVLLM checkpoint or a plain minillm checkpoint."""
         state = _torch_load(Path(path))
+        saved_cfg = (state.get("config") or {}).get("llm") or {}
+        saved_backend = str(saved_cfg.get("backend", "gpt2")).lower()
+        if saved_backend != self.backend:
+            raise ValueError(
+                f"{path} holds {saved_backend} LLM weights, but this model uses "
+                f"{self.backend}; start with the matching --qwen flag"
+            )
         if "llm" in state:
             llm_state = state["llm"]
         elif "model" in state:

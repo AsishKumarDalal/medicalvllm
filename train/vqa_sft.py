@@ -16,23 +16,31 @@ logged once at INFO level. Run::
 
 import argparse
 import logging
+import math
 import time
 from pathlib import Path
 
 import torch
 
 from .common import (
+    QWEN_MODEL,
     Metrics,
     RunState,
     StopSignal,
+    assert_finite_parameters,
     atomic_torch_save,
     build_progress_bar,
     build_checkpoint,
     build_lr_lambda,
+    build_optimizer,
+    checkpoint_llm_backend,
     clip_grad_norm,
     fast_forward_scheduler,
+    finalize_llm_config,
     get_device,
     latest_local_checkpoint,
+    make_qwen_llm_config,
+    nonfinite_parameter_names,
     select_devices,
     load_optimizer_state_named,
     load_yaml,
@@ -48,9 +56,10 @@ from .common import (
     shutdown_streaming_http,
     unwrap_model,
 )
-from .hf_sync import download_latest, upload_checkpoint, upload_outs
+from .hf_sync import download_latest, remote_phase_dir, upload_checkpoint, upload_outs
 from data.collate import collate_fn
 from data.medical_vqa import BatchMixSampler, SOURCES, VQAStream, build_vqa_streams
+from data.tokenizer import set_tokenizer_backend
 from model.medical_vllm import MedicalVLLM
 
 logger = logging.getLogger(__name__)
@@ -58,17 +67,66 @@ ROOT = Path(__file__).resolve().parents[1]
 PHASE = 2
 
 
-def build_model(cfg, base, device, llm_cfg=None):
+def build_model(
+    cfg, base, device, llm_cfg=None,
+    use_qwen=False, qwen_model=QWEN_MODEL,
+):
     """Build phase 2 from the checkpoint given by ``init_from`` (or --new)."""
     state = torch.load(cfg["_init_from"], map_location="cpu", weights_only=True) \
         if cfg.get("_init_from") else {}
+    saved_llm_cfg = None
+    if "config" in state:
+        saved_llm_cfg = state["config"]["llm"]
+    elif "model_config" in state:
+        saved_llm_cfg = state["model_config"]
+
+    backend = "qwen" if use_qwen else "gpt2"
+    saved_backend = checkpoint_llm_backend(cfg.get("_init_from")) or "gpt2"
+    can_load = bool(cfg.get("_init_from")) and saved_backend == backend
+
     if llm_cfg is None:
-        if "config" in state:
-            llm_cfg = state["config"]["llm"]
-        elif "model_config" in state:
-            llm_cfg = state["model_config"]
+        if backend == "qwen":
+            qwen_cfg = dict(cfg.get("qwen") or {})
+            if saved_backend == "qwen" and saved_llm_cfg:
+                llm_cfg = dict(saved_llm_cfg)
+                # Architecture/token ids come from the checkpoint, but precision
+                # and VRAM settings come from the CURRENT YAML/CLI (an old fp32
+                # checkpoint must not silently disable fp16 / checkpointing).
+                for key in ("context_length", "dtype", "gradient_checkpointing"):
+                    if key in qwen_cfg:
+                        llm_cfg[key] = qwen_cfg[key]
+                llm_cfg["model_name"] = qwen_model
+            else:
+                llm_cfg = make_qwen_llm_config(
+                    model_name=qwen_model,
+                    context_length=int(qwen_cfg.get("context_length", 1024)),
+                    dtype=str(qwen_cfg.get("dtype", "float32")),
+                    gradient_checkpointing=bool(
+                        qwen_cfg.get("gradient_checkpointing", False)
+                    ),
+                )
+            llm_cfg = finalize_llm_config(llm_cfg)
+        elif saved_llm_cfg:
+            llm_cfg = dict(saved_llm_cfg)
         else:
             llm_cfg = load_yaml(base / "configs" / "model.yaml")
+
+    if backend == "qwen":
+        # AdamW stores moments in the parameter dtype. In fp16 the default
+        # eps=1e-8 underflows to 0, tiny squared grads flush to 0, and AdamW
+        # divides 0/0: every weight becomes NaN in one step. Full Qwen SFT
+        # therefore always trains in fp32; gradient checkpointing keeps it
+        # inside a 16 GB T4. (Mixed precision saves nothing here because a
+        # correct fp32 master + fp32 moments costs the same as fp32.)
+        requested = str(llm_cfg.get("dtype", "float32")).lower()
+        if requested not in {"float32", "fp32"}:
+            logger.warning(
+                "Qwen training in %s would poison the weights with NaN "
+                "(fp16/bf16 AdamW moments underflow); using float32 instead",
+                requested,
+            )
+            llm_cfg = dict(llm_cfg)
+            llm_cfg["dtype"] = "float32"
 
     if "config" in state:
         vision_cfg = state["config"]["vision"]
@@ -78,8 +136,13 @@ def build_model(cfg, base, device, llm_cfg=None):
         connector_cfg = vision_cfg
 
     model = MedicalVLLM(llm_cfg, vision_cfg, connector_cfg).to(device)
-    if cfg.get("_init_from"):
+    if can_load:
         model.load(cfg["_init_from"], load_connector=True, strict_llm=True)
+    elif cfg.get("_init_from") and saved_backend != backend:
+        logger.warning(
+            "ignoring %s LLM weights in %s (backend mismatch: %s != %s)",
+            saved_backend, cfg["_init_from"], saved_backend, backend,
+        )
     if bool(cfg.get("freeze_llm", False)):
         model.freeze_llm()
     else:
@@ -107,6 +170,24 @@ def main(argv=None):
                     help="never read or write HuggingFace")
     ap.add_argument("--new", action="store_true",
                     help="random LLM weights; ignore all checkpoints; step 0")
+    ap.add_argument("--qwen", action="store_true",
+                    help=f"use Qwen3 instead of the GPT-2/minillm LLM (default {QWEN_MODEL})")
+    ap.add_argument("--qwen-model", default=None,
+                    help=f"HuggingFace Qwen model id (default {QWEN_MODEL})")
+    ap.add_argument("--qween", dest="qwen", action="store_true",
+                    help=argparse.SUPPRESS)  # common misspelling
+    ap.add_argument("--save", dest="save_minutes", type=float, default=None,
+                    help="save a checkpoint every N minutes (always local; also uploaded when --hf is given)")
+    ap.add_argument("--batch-size", dest="batch_size", type=int, default=None,
+                    help="micro-batch size (overrides config; effective batch = batch-size × grad_accum_steps)")
+    ap.add_argument("--batch", dest="batch_size", type=int,
+                    default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    ap.add_argument("--dtype", choices=["float32", "float16", "bfloat16", "auto"],
+                    default=None, help="LLM dtype for --qwen (overrides config qwen.dtype; training is auto-promoted to float32)")
+    ap.add_argument("--sample", type=int, default=None,
+                    help="show one generation every N optimizer steps (0 disables; overrides config)")
+    ap.add_argument("--smaple", dest="sample", type=int,
+                    default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
     if args.detach:
@@ -117,6 +198,24 @@ def main(argv=None):
     set_seed(args.seed)
     base = Path(args.config).resolve().parents[1]
     cfg = load_yaml(args.config)
+
+    # CLI overrides for cadence (config values are the fallbacks).
+    if args.save_minutes is not None:
+        cfg["checkpoint_interval_minutes"] = float(args.save_minutes)
+        logger.info(
+            "checkpoint interval: %g minute(s) (local save; uploaded too with --hf)",
+            args.save_minutes,
+        )
+    if args.sample is not None:
+        cfg["sample_interval"] = int(args.sample)
+        logger.info("sample interval: %d optimizer step(s)", args.sample)
+    if args.batch_size is not None:
+        cfg["batch_size"] = int(args.batch_size)
+        logger.info("batch size: %d", args.batch_size)
+    if args.dtype is not None:
+        cfg.setdefault("qwen", {})["dtype"] = args.dtype
+        logger.info("Qwen dtype: %s", args.dtype)
+
     device, gpu_ids = select_devices(
         args.device,
         args.num_gpus if args.num_gpus is not None else int(cfg.get("num_gpus", 2)),
@@ -127,6 +226,15 @@ def main(argv=None):
     hf_cfg = dict(cfg.get("hf") or {})
     hf_cfg["enabled"] = use_hf
     logger.info("HF sync %s", "ENABLED (--hf)" if use_hf else "DISABLED")
+
+    # Qwen: <repo>/medical_vllm/qwen/align and .../sft (set before download).
+    if args.qwen and cfg.get("hf_qwen"):
+        hf_cfg.update(dict(cfg["hf_qwen"]))
+        logger.info(
+            "HF Qwen layout: repo=%s dirs=%s / %s",
+            hf_cfg.get("repo"),
+            remote_phase_dir(hf_cfg, 1), remote_phase_dir(hf_cfg, 2),
+        )
 
     ckpt_dir = resolve_path(cfg.get("checkpoint_dir", "checkpoints/vqa"), base)
     out_dir = resolve_path(cfg.get("out_dir", "outs/vqa"), base)
@@ -153,13 +261,40 @@ def main(argv=None):
                 logger.info("no checkpoint found; starting phase 2 from scratch")
     if args.new:
         logger.info("--new: random LLM weights, starting at step 0")
+
+    # --------------------------------------------------------- LLM backend
+    qwen_cfg = dict(cfg.get("qwen") or {})
+    qwen_model = args.qwen_model or str(qwen_cfg.get("model", QWEN_MODEL))
+    use_qwen = bool(args.qwen)
+    if resume:
+        resume_backend = checkpoint_llm_backend(resume)
+        if resume_backend == "qwen":
+            use_qwen = True
+            logger.info("checkpoint %s uses Qwen; switching tokenizer/LLM backend",
+                        resume)
+        elif use_qwen:
+            logger.warning(
+                "ignoring %s checkpoint %s: --qwen cannot reuse GPT-2 weights",
+                resume_backend, resume,
+            )
+            resume = None
+    set_tokenizer_backend("qwen" if use_qwen else "gpt2", model_name=qwen_model)
+    if use_qwen:
+        logger.info("LLM backend: Qwen3 (%s)", qwen_model)
+
     cfg["_init_from"] = None if args.new else str(resume) if resume else None
 
     model, llm_cfg, vision_cfg, connector_cfg = build_model(
-        cfg, base, device
+        cfg, base, device, use_qwen=use_qwen, qwen_model=qwen_model
     )
     counts = model.param_counts()
     logger.info("params (M): %s", {k: round(v / 1e6, 2) for k, v in counts.items()})
+    logger.info(
+        "LLM dtype=%s grad_checkpointing=%s",
+        model.llm.tok_emb.weight.dtype,
+        getattr(getattr(model.llm, "hf", None), "is_gradient_checkpointing", False),
+    )
+    assert_finite_parameters(model, source=str(resume or "fresh Qwen model"))
 
     # ---------------------------------------------------------------- data
     budget = int(cfg["data"].get("max_seq_budget", 112))
@@ -187,7 +322,10 @@ def main(argv=None):
         {"params": list(model.llm.parameters()),
          "lr": float(cfg.get("lr_llm", 1e-5))},
     ]
-    optimizer = torch.optim.AdamW(groups, weight_decay=0.01)
+    optimizer = build_optimizer(
+        groups, str(cfg.get("optimizer", "adamw")), weight_decay=0.01
+    )
+    logger.info("optimizer: %s", type(optimizer).__name__)
 
     max_steps = args.steps or cfg.get("steps")
     max_hours = args.hours or cfg.get("hours")
@@ -198,10 +336,10 @@ def main(argv=None):
     total = max_steps or 10_000
     warmup = int(cfg.get("warmup_steps", 100))
     lr_fn = build_lr_lambda(warmup, total)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        [lambda s: lr_fn(s), lambda s: lr_fn(s) * 0.2],
-    )
+    # One schedule for all groups: each group's base lr already encodes the
+    # connector:LLM ratio (5e-5 : 1e-5). The old extra *0.2 on the LLM group
+    # silently turned lr_llm=1e-5 into a 2e-6 peak.
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_fn)
 
     state = RunState(phase=PHASE)
     if resume and not args.new:
@@ -235,7 +373,11 @@ def main(argv=None):
 
     base_model = model
     if len(gpu_ids) > 1:
-        model = torch.nn.DataParallel(model, device_ids=gpu_ids)
+        # Gather outputs on the LAST GPU: with DataParallel the optimizer and
+        # the gathered logits otherwise all sit on GPU 0, which OOMs first.
+        model = torch.nn.DataParallel(
+            model, device_ids=gpu_ids, output_device=gpu_ids[-1]
+        )
         logger.info("using nn.DataParallel across %d GPUs: %s",
                     len(gpu_ids), gpu_ids)
     else:
@@ -255,16 +397,21 @@ def main(argv=None):
     t0 = time.time()
     last_save = t0
     interval = float(cfg.get("checkpoint_interval_minutes", 60)) * 60
-    hf_interval = float(
-        cfg.get("hf_upload_interval_minutes", interval / 60)
-    ) * 60
-    last_hf_upload = t0
     log_first = int(cfg.get("log_first_steps", 10))
     log_every = int(cfg.get("log_interval", 100))
     running, nloss, micro, halted = 0.0, 0, 0, False
     gn = 0.0
+    nan_skips = 0
+    fatal = False
 
     def save(tag):
+        bad = nonfinite_parameter_names(base_model)
+        if bad:
+            logger.error(
+                "refusing to save %s checkpoint: %d non-finite parameter "
+                "tensor(s), e.g. %s", tag, len(bad), ", ".join(bad[:3]),
+            )
+            return None
         state.elapsed_seconds = time.time() - t0
         ckpt = build_checkpoint(
             base_model, state, optimizer, scheduler,
@@ -283,7 +430,7 @@ def main(argv=None):
         return step_path
 
     def upload_to_hf(step_path):
-        if not use_hf:
+        if not use_hf or step_path is None:
             return
         save_plots(out_dir)   # regenerate graphs before uploading
         ok_ckpt = upload_checkpoint(hf_cfg, PHASE, step_path, state.step)
@@ -297,6 +444,10 @@ def main(argv=None):
     logger.info("Stage 2 start: step=%d steps=%s hours=%s batch=%s accum=%s",
                 state.step, max_steps, max_hours, batch_size, accum)
     pbar = build_progress_bar(PHASE, bar_steps, bar_hours, state, epoch_size)
+    if pbar is not None:
+        # "loss nan" is honest: no optimizer step has been measured yet. The
+        # old initial "loss 0.000" looked like a real zero loss.
+        pbar.set_postfix_str(postfix(state, float("nan"), 0.0))
     model.train()
     optimizer.zero_grad(set_to_none=True)
     try:
@@ -320,6 +471,24 @@ def main(argv=None):
             loss = out[1] if isinstance(out, tuple) else out
             if loss.dim() > 0:      # DataParallel gathers scalar losses into a vector
                 loss = loss.mean()
+            if not bool(loss.isfinite()):
+                # Never backprop a NaN/Inf: it would poison every parameter
+                # and every AdamW moment. Skip the batch instead.
+                nan_skips += 1
+                logger.warning(
+                    "non-finite loss at step %d (micro %d), skipping batch "
+                    "(consecutive skips: %d)", state.step, micro, nan_skips,
+                )
+                if nan_skips >= 20:
+                    fatal = True
+                    raise RuntimeError(
+                        "20 consecutive non-finite losses; the weights are "
+                        "probably already NaN. Restore a clean checkpoint or "
+                        "rerun with --new."
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                continue
+            nan_skips = 0
             (loss / accum).backward()
             running += loss.item()
             nloss += 1
@@ -338,7 +507,7 @@ def main(argv=None):
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 state.step += 1
-                avg = running / max(1, nloss)
+                avg = running / nloss if nloss else float("nan")
                 running, nloss = 0.0, 0
                 state.elapsed_seconds = time.time() - t0
                 progress_update(
@@ -358,7 +527,9 @@ def main(argv=None):
                         state.total_text_tokens, state.total_images_seen,
                     )
                 metrics.log(
-                    step=state.step, loss=round(avg, 5), source=source,
+                    step=state.step,
+                    loss=round(avg, 5) if math.isfinite(avg) else None,
+                    source=source,
                     lr_connector=optimizer.param_groups[0]["lr"],
                     lr_llm=optimizer.param_groups[1]["lr"],
                     grad_norm=round(gn, 4),
@@ -371,7 +542,8 @@ def main(argv=None):
                     log_sample_generation(
                         base_model, sample_iter, device, state.step, pbar,
                         out_dir=out_dir,
-                        max_new_tokens=int(cfg.get("sample_max_new_tokens", 32)),
+                        max_new_tokens=int(cfg.get("sample_max_new_tokens", 200)),
+                        max_text_tokens=int(cfg.get("sample_max_tokens", 200)),
                         temperature=float(cfg.get("sample_temperature", 0.0)),
                         top_k=cfg.get("sample_top_k") or None,
                     )
@@ -386,9 +558,7 @@ def main(argv=None):
             if now - last_save >= interval:
                 step_path = save(f"step{state.step}")
                 last_save = now
-                if now - last_hf_upload >= hf_interval:
-                    upload_to_hf(step_path)
-                    last_hf_upload = now
+                upload_to_hf(step_path)   # no-op unless --hf was given
     except (KeyboardInterrupt, StopIteration):
         halted = True
     finally:
@@ -399,13 +569,29 @@ def main(argv=None):
         if sample_stream is not None:
             sample_stream.close()
         shutdown_streaming_http()
-        final_path = save("final")
+        halted = halted or fatal
+        if fatal:
+            logger.error(
+                "aborted on non-finite loss; NOT saving a final checkpoint "
+                "(the last good checkpoint is untouched)"
+            )
+            final_path = None
+        else:
+            final_path = save("final")
         metrics.log(event="end", step=state.step, halted=halted,
                     hours=round((time.time() - t0) / 3600, 3),
                     total_text_tokens=state.total_text_tokens,
                     total_images_seen=state.total_images_seen)
-        if use_hf:
+        if use_hf and final_path is not None:
             upload_to_hf(final_path)
+        for i in gpu_ids:
+            try:
+                logger.info(
+                    "GPU %d peak allocated %.2f GB", i,
+                    torch.cuda.max_memory_allocated(i) / 1e9,
+                )
+            except Exception:
+                pass
         logger.info("Stage 2 done at step %d; stats=%s", state.step,
                     {k: v.stats for k, v in streams.items()})
     return state.step

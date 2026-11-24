@@ -1,6 +1,13 @@
 # configs/align.yaml — Stage 1: connector-only alignment on ROCOv2 captions
 llm_checkpoint: ../minillm/sft_checkpoints/sft_model.pt   # normal SFT, NOT tool-calling
 hf_fallback: {repo: sddfhy546y/minillm, filename: sft_model.pt}
+# `python -m train.align --qwen` swaps GPT-2 for Qwen/Qwen3-0.6B. The GPT-2 SFT
+# checkpoint above is then ignored (fresh pretrained Qwen + fresh connector).
+qwen:
+  model: Qwen/Qwen3-0.6B
+  context_length: 1024
+  dtype: float32              # training dtype; fp16/bf16 are auto-promoted (AdamW stability)
+  gradient_checkpointing: false
 data:
   dataset: eltorio/ROCOv2-radiology   # verified: image, image_id, caption, cui
   radiology_only: true
@@ -18,11 +25,11 @@ epochs: 2
 hours: 4
 grad_clip: 1.0
 sample_interval: 500          # every N steps: show 1 dataset image + generation
-sample_max_new_tokens: 32
+sample_max_new_tokens: 200    # generate up to 200 new tokens for the sample
+sample_max_tokens: 200        # show at most 200 tokens of PROMPT/GENERATED/REFERENCE
 sample_temperature: 0.0       # greedy, so samples are reproducible
 sample_top_k: null
-checkpoint_interval_minutes: 60
-hf_upload_interval_minutes: 60     # push checkpoint + graphs to HF every hour
+checkpoint_interval_minutes: 60     # save locally every N min; with --hf also upload on each save
 checkpoint_dir: /kaggle/temp/medicalvllm/align
 out_dir: /kaggle/temp/medicalvllm/outs/align
 # --hf enables BOTH download (medical_vllm/phase1/phase_1_latest.pt) and upload.
@@ -31,3 +38,10 @@ hf:
   enabled: false
   repo: AsishKumarDalal/medicalvllm   # HF model repo; set HF_TOKEN to upload
   root: medical_vllm                  # folder inside the repo; phase1/ added
+# With --qwen + --hf these keys replace the hf.* layout above, so checkpoints
+# land in <repo>/medical_vllm/qwen/align/ (and .../sft/ for Stage 2).
+# Uncomment `repo` to push Qwen runs to a different repo (e.g. sddfhy546y/minillm).
+hf_qwen:
+  root: medical_vllm/qwen
+  phase_names: {1: align, 2: sft}
+  # repo: sddfhy546y/minillm

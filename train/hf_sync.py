@@ -1,6 +1,6 @@
 """HuggingFace checkpoint sync. ONLY active when ``--hf`` is passed.
 
-Remote layout (single repo, one folder per phase)::
+Remote layout depends on the LLM backend. GPT-2 (default)::
 
     <repo>/medical_vllm/phase1/
         phase_1_latest.pt
@@ -13,6 +13,16 @@ Remote layout (single repo, one folder per phase)::
         checkpoints/...
         outs/...
 
+Qwen (``--qwen``)::
+
+    <repo>/medical_vllm/qwen/align/     (phase 1)
+    <repo>/medical_vllm/qwen/sft/       (phase 2)
+
+The folder names come from the ``hf`` config: ``root`` and ``phase_names``
+(``root: medical_vllm/qwen``, ``{1: align, 2: sft}`` for Qwen). ``hf_qwen`` in
+the YAML overrides those keys when ``--qwen`` is passed, so a Qwen run can also
+target a different repo.
+
 With ``--no-hf`` (or no flag) nothing is downloaded and nothing is uploaded.
 """
 
@@ -22,6 +32,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_ROOT = "medical_vllm"
+DEFAULT_PHASE_NAMES = {1: "phase1", 2: "phase2"}
 
 
 def _enabled(cfg: dict) -> bool:
@@ -29,7 +40,19 @@ def _enabled(cfg: dict) -> bool:
 
 
 def remote_phase_dir(cfg: dict, phase: int) -> str:
-    return f"{cfg.get('root', DEFAULT_ROOT).strip('/')}/phase{phase}"
+    """Remote folder for a phase, e.g. ``medical_vllm/phase1`` or ``qwen/sft``."""
+    cfg = cfg or {}
+    root = str(cfg.get("root", DEFAULT_ROOT)).strip("/")
+    names = cfg.get("phase_names") or DEFAULT_PHASE_NAMES
+    name = None
+    for key in (phase, str(phase)):
+        if key in names:
+            name = names[key]
+            break
+    if name is None:
+        name = DEFAULT_PHASE_NAMES.get(phase, f"phase{phase}")
+    name = str(name).strip("/")
+    return f"{root}/{name}" if root else name
 
 
 def latest_filename(phase: int) -> str:

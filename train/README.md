@@ -7,6 +7,7 @@ This folder contains the two training stages and all the shared plumbing.
 | `align.py` | **Stage 1** — connector-only alignment on ROCOv2 captions |
 | `vqa_sft.py` | **Stage 2** — connector + LLM medical VQA SFT |
 | `common.py` | config, seeding, devices, optimizer/scheduler helpers, `RunState`, checkpoint build/restore, tqdm bar, live samples, metrics, plots, streaming-shutdown fix |
+| `notebook.py` | run a trainer in the kernel or watch its samples from a notebook cell |
 | `hf_sync.py` | HuggingFace download/upload — **only active with `--hf`** |
 | `__init__.py` | package marker |
 
@@ -59,6 +60,12 @@ Both trainers share the same flags.
 | `--hf` | off | **Enable HF**: download the phase's `*_latest.pt` if present, and upload checkpoints + `outs/` after every save. |
 | `--no-hf` | off | Explicitly disable HF even if config says `enabled: true`. |
 | `--new` | off | Random LLM weights, ignore every checkpoint, start at **global step 0**. |
+| `--qwen` | off | Use `Qwen/Qwen3-0.6B` instead of the GPT-2/minillm decoder. Also switches the tokenizer, the answer terminator and the batch pad id. |
+| `--qwen-model ID` | `Qwen/Qwen3-0.6B` | Override the HuggingFace model id used by `--qwen`. |
+| `--save N` | config `checkpoint_interval_minutes` (60) | Save a checkpoint every **N minutes**. Always saves locally; with `--hf` the same save also uploads. |
+| `--sample N` | config `sample_interval` (500) | Show a generation every **N optimizer steps**. `0` disables. Alias: `--smaple`. |
+| `--batch-size N` | config `batch_size` (16 / 8) | Micro-batch size. Effective batch = `N × grad_accum_steps`. Alias: `--batch`. |
+| `--dtype TYPE` | config `qwen.dtype` | LLM precision for `--qwen`: `float32`, `float16`, `bfloat16` or `auto`. Training defaults to `float32`; fp16/bf16 are auto-promoted (AdamW would NaN). |
 
 ### Important flag interactions
 
@@ -67,6 +74,69 @@ Both trainers share the same flags.
 - `--new` wins over everything: no HF download, no local checkpoint, no SFT
   weights. The connector is also freshly initialised.
 - If both `--steps` and `--hours` are given, the progress bar follows **steps**.
+- `--qwen` must be used in **both** stages. GPT-2 and Qwen checkpoints are not
+  weight-compatible: if a trainer sees a checkpoint from the other backend it
+  logs a warning and starts from pretrained Qwen (or the GPT-2 SFT) with a fresh
+  connector. A checkpoint that already records `config.llm.backend: qwen`
+  switches the tokenizer/LLM automatically, so plain resume still works.
+
+### Qwen3 backend (`--qwen`)
+
+```bash
+python -m train.align --qwen --steps 200
+python -m train.vqa_sft --qwen --steps 100
+python -m eval.vqa_eval --qwen --checkpoint <qwen-ckpt> --source vqa_rad
+```
+
+| Aspect | GPT-2 (default) | Qwen (`--qwen`) |
+| --- | --- | --- |
+| LLM | minillm GPT (102.5M) | `Qwen/Qwen3-0.6B` (596M), wrapped by `model/qwen_llm.py` |
+| Tokenizer | tiktoken GPT-2 BPE | HF Qwen2Tokenizer, no special tokens added to prompts |
+| EOT / pad | `50256` / `50256` | `<|im_end|>` `151645` / `<|endoftext|>` `151643` |
+| Context | 128 (SFT checkpoint) | 1024 (configurable; model supports 40960) |
+| Embedding width | 768 | 1024 — connector gains a `proj_in` layer (768 → 1024) |
+| Attention heads (connector) | 12 | 16 (auto-selected as a divisor of 1024) |
+| Initial weights | released minillm SFT | pretrained Qwen3 (Stage 1 then freezes it) |
+
+Qwen's training loss is computed outside HF's `labels=` path so it is identical
+in shape to the GPT path: logits at position *t* vs label at position *t*, with
+`-100` masking prompt and visual-prefix positions. Generation uses an explicit
+`DynamicCache` with absolute positions, which makes cached decoding match the
+full forward pass. The backend, model id and token ids are written into every
+checkpoint's `config.llm`, so sampling and eval decode with the right tokenizer.
+Tune `qwen.{model,context_length,dtype,gradient_checkpointing}` in the YAML (or
+`--dtype` on the CLI). Stage 2 trains in **float32** with
+`gradient_checkpointing: true` and **Adafactor**. fp16 is not usable for full
+fine-tuning here: AdamW stores its moments in the parameter dtype, `eps=1e-8`
+underflows to 0 in fp16, and small squared gradients flush to 0, so the first
+step divides 0/0 and turns every weight into NaN. A correct fp32 master + fp32
+moments costs the same memory as fp32, and AdamW's two full moments do not fit a
+16 GB T4 at 0.6B. Stage 2 therefore uses Adafactor (below) with gradient
+checkpointing. `--dtype float16`/`bfloat16` is auto-promoted to float32 with a
+warning.
+
+Adafactor keeps the same fp32 weights/gradients but stores only row/column
+variance instead of AdamW's two full moment tensors, freeing ~4.8 GB per GPU
+for a 0.6B model. `optimizer: adamw` is still available when there is enough
+VRAM (e.g. a larger GPU).
+
+If a checkpoint already contains NaN weights, startup raises immediately with
+the offending tensor names instead of training. A checkpoint is never written
+when any parameter is non-finite, and an abort on 20 consecutive non-finite
+losses skips the final save — so a poisoned run cannot overwrite the last good
+checkpoint.
+
+`nn.DataParallel` gathers outputs on the **last** GPU (`output_device`), so the
+big logits/cross-entropy buffers are not all created on GPU 0 — without this,
+GPU 0 hits ~14 GB while GPU 1 sits at ~5 GB. `PYTORCH_CUDA_ALLOC_CONF=
+expandable_segments:True` is also set before CUDA starts to reduce allocator
+fragmentation. `select_devices()` skips any GPU with less than 3 GiB free, so a
+busy GPU is never chosen for a DataParallel replica.
+
+On resume, `dtype` and `gradient_checkpointing` come from the **current**
+YAML/CLI, not from the checkpoint's saved config — only architecture and token
+ids come from the checkpoint. Otherwise an old fp32 checkpoint silently
+disables both and causes the same OOM again.
 
 ---
 
@@ -92,7 +162,8 @@ Both trainers share the same flags.
 | `hours` | 4 | Wall-clock stop. |
 | `grad_clip` | 1.0 | Max L2 grad norm. The `gn` in the bar is the norm **before** clipping. |
 | `sample_interval` | 500 | Every N steps: show one dataset image + model generation. `0` disables. |
-| `sample_max_new_tokens` | 32 | How many tokens the sample generates. |
+| `sample_max_new_tokens` | 200 | How many tokens the sample generates. |
+| `sample_max_tokens` | 200 | Show at most N tokens of each `PROMPT` / `GENERATED` / `REFERENCE` field. |
 | `sample_temperature` | 0.0 | Greedy by default, so samples are reproducible. |
 | `sample_top_k` | null | Optional top-k filter for samples. |
 | `checkpoint_interval_minutes` | 60 | Periodic save interval (plus a final save on stop). |
@@ -117,11 +188,13 @@ Shares `num_gpus`, `batch_size`, `grad_accum_steps`, `warmup_steps`, `epochs`,
 | `data.epoch_size` | 200000 | Approximate mixed-dataset size for `epoch` reporting. |
 | `freeze_llm` | false | Stage 2 trains the GPT. Set `true` to keep it frozen. |
 | `lora` | `{enabled: false, ...}` | Reserved — v1 does full fine-tuning; LoRA is not implemented yet. |
-| `lr_llm` | 1e-5 | LR for the LLM parameter group. |
+| `optimizer` | `adafactor` | `adafactor` (fp32, row/col variance — ~4.8 GB less than AdamW) or `adamw`. |
+| `lr_llm` | 1e-5 | LR for the LLM parameter group (used directly; no extra group scaling). |
 | `lr_connector` | 5e-5 | LR for the connector group (higher, it adapts faster). |
 | `eval.every_steps` | 1000 | Run a quick eval-loss pass every N steps. `0` disables. |
 | `eval.dev_samples` | 200 | How many dev examples to evaluate. |
-| `checkpoint_dir` | `checkpoints/vqa` | Where `phase_2_latest.pt` and `phase2_step*.pt` go. |
+| `checkpoint_dir` | `/kaggle/temp/medicalvllm/checkpoints/vqa` | Where `phase_2_latest.pt` and `phase2_step*.pt` go — on the large `/kaggle/temp` mount (Qwen fp32 + Adafactor is ~2.4 GB; AdamW would be ~7 GB). |
+| `out_dir` | `/kaggle/temp/medicalvllm/outs/vqa` | Metrics JSON, graphs and `samples/` for Stage 2. |
 
 ---
 
@@ -215,6 +288,53 @@ Every `sample_interval` steps one real dataset example is shown:
 Phase 1 samples ROCOv2 captions; Phase 2 samples a fixed VQA-RAD source so
 samples stay comparable over time.
 
+`--sample N` (or `sample_interval` in the YAML) controls how often this happens,
+in **optimizer steps**. Each sample is rendered as a matplotlib figure — the
+image on top, a `PROMPT / GENERATED / REFERENCE` caption underneath — and
+saved in two places:
+
+```
+out_dir/sample_latest.png                 # newest sample, beside the graphs
+out_dir/samples/sample_step0000200.png    # every sample, kept forever
+```
+
+`sample_max_tokens` (200) caps how many tokens of each field are decoded for
+the sample, so the full instruction is visible instead of being cut at a
+character count. `sample_max_new_tokens` (200) caps generation.
+
+#### Showing samples inside the notebook
+
+A trainer started with `python -m ...` is a separate process with no IPython
+display hook, so it cannot call `display()` itself. Two reliable options:
+
+**1. Run training in the kernel** — every sample appears live while the cell
+runs:
+
+```python
+from train.notebook import run_training
+run_training("vqa_sft", ["--qwen", "--sample", 10])
+```
+
+`%run -m train.vqa_sft --qwen --sample 10` works the same way from the repo
+root. Use `run_training("align", [...])` for Stage 1.
+
+**2. Keep training in a terminal and watch it from a blocking cell**:
+
+```python
+from train.notebook import watch_samples
+watch_samples("/kaggle/temp/medicalvllm/outs/vqa")   # interrupt the cell to stop
+```
+
+The cell must stay busy: Jupyter only renders `display()` calls made while a
+cell is executing. `watch_samples(..., clear=False)` keeps every sample
+instead of replacing the previous one; `show_latest(out_dir)` displays the
+newest file once.
+
+For `!python -m train.vqa_sft ...` in a cell, the trainer queues a display
+request to the kernel. The kernel is busy with that cell, so the images show
+up together when it ends — use option 1 or 2 for live updates. The figures are
+also pushed to HF with the other `outs/*.png` files.
+
 ---
 
 ## 5. Checkpoint format
@@ -295,26 +415,42 @@ One repo (`hf.repo`), two folders (`hf.root` + `/phaseN/`):
 ```
 <repo>/
 └── medical_vllm/
-    ├── phase1/
+    ├── phase1/                     (GPT-2, default)
     │   ├── phase_1_latest.pt
     │   ├── checkpoints/phase_1_step000010000.pt
     │   └── outs/metrics.json, metrics.jsonl, loss_vs_step.png, lr_vs_step.png
-    └── phase2/
-        ├── phase_2_latest.pt
-        ├── checkpoints/phase_2_step000010100.pt
-        └── outs/...
+    ├── phase2/                     (GPT-2, default)
+    │   ├── phase_2_latest.pt
+    │   ├── checkpoints/phase_2_step000010100.pt
+    │   └── outs/...
+    └── qwen/                       (--qwen)
+        ├── align/
+        │   ├── phase_1_latest.pt
+        │   ├── checkpoints/phase_1_step000010000.pt
+        │   └── outs/...
+        └── sft/
+            ├── phase_2_latest.pt
+            ├── checkpoints/phase_2_step000010100.pt
+            └── outs/...
 ```
+
+The Qwen folders come from `hf_qwen.root: medical_vllm/qwen` and
+`hf_qwen.phase_names: {1: align, 2: sft}`. They are applied to both download
+and upload as soon as `--qwen` is passed. Uncomment `hf_qwen.repo` in the YAML
+to send Qwen checkpoints to a different repository (e.g.
+`sddfhy546y/minillm`); otherwise the `hf.repo` repository is used.
 
 - `upload_checkpoint()` writes **both** `phase_N_latest.pt` and a numbered copy
   under `checkpoints/`.
 - `upload_outs()` uploads metrics JSON plus every `*.png` graph from `out_dir`.
-- Both happen together on a timer: every `hf_upload_interval_minutes` (default
-  **60**, i.e. hourly) the trainer regenerates the graphs, uploads the latest
-  checkpoint **and** `outs/` (metrics + `loss_vs_step.png` + `lr_vs_step.png`),
-  and logs `HF sync phase N: checkpoint=OK graphs/metrics=OK at step ...`.
-  It also runs once on the final save. Upload failures only warn — the local
-  checkpoint is already safely written. Set `hf_upload_interval_minutes` in
-  either config to change the cadence.
+- Saving and uploading are now **one event**. Every `checkpoint_interval_minutes`
+  (default **60**, or `--save N`) the trainer writes the local
+  checkpoint, regenerates the graphs, and — only if `--hf` was passed — uploads
+  the checkpoint **and** `outs/` (metrics + graphs). It logs
+  `HF sync phase N: checkpoint=OK graphs/metrics=OK at step ...`. With `--no-hf`
+  the same timer just saves locally and the upload call is a no-op.
+- The final save on stop also uploads when `--hf` is active. Upload failures
+  only warn — the local checkpoint is already safely written.
 - The 86M vision tower is never uploaded — only its name is in the checkpoint.
 
 ### Resume priority

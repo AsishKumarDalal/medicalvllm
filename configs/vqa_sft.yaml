@@ -1,5 +1,16 @@
 # configs/vqa_sft.yaml — Stage 2: medical VQA instruction tuning (connector + LLM)
 init_from: /kaggle/temp/medicalvllm/align/phase_1_latest.pt   # phase-1 hand-off if no local phase-2 ckpt
+# `python -m train.vqa_sft --qwen` swaps GPT-2 for Qwen/Qwen3-0.6B. A GPT-2
+# phase-1 checkpoint is then ignored; run both stages with --qwen together.
+qwen:
+  model: Qwen/Qwen3-0.6B
+  context_length: 1024
+  # fp16 is NOT safe for training: AdamW's eps=1e-8 underflows to 0 in fp16
+  # and every weight becomes NaN after one step. Training runs in fp32 with
+  # Adafactor + gradient checkpointing, which fits a 16 GB T4. `--dtype
+  # float16` is auto-promoted to float32 with a warning.
+  dtype: float32
+  gradient_checkpointing: true  # recompute activations in backward; big VRAM saving for full Qwen SFT
 data:
   mix: {pmc_vqa: 0.55, path_vqa: 0.20, slake: 0.10, vqa_rad: 0.05, text_replay: 0.10}
   max_seq_budget: 112          # context_length 128 - K 16
@@ -8,26 +19,35 @@ data:
 freeze_llm: false
 num_gpus: 2                     # use both GPUs via nn.DataParallel when available
 lora: {enabled: false, r: 16, alpha: 32}
+# adafactor keeps fp32 weights/grads (no NaN) but only row/col variance, ~4.8 GB
+# less than AdamW on a 0.6B model. Use `optimizer: adamw` if you have the VRAM.
+optimizer: adafactor
 lr_llm: 1.0e-5
 lr_connector: 5.0e-5
 warmup_steps: 100
-batch_size: 8
+batch_size: 4                    # 2 per GPU with num_gpus=2; Qwen fp32 peaks ~11 GB on GPU 0
 grad_accum_steps: 2
 epochs: 2
 hours: 8
 grad_clip: 1.0
 sample_interval: 500          # every N steps: show 1 VQA-RAD image + generation
-sample_max_new_tokens: 32
+sample_max_new_tokens: 200    # generate up to 200 new tokens for the sample
+sample_max_tokens: 200        # show at most 200 tokens of PROMPT/GENERATED/REFERENCE
 sample_temperature: 0.0
 sample_top_k: null
 eval: {every_steps: 1000, dev_samples: 200}
-checkpoint_interval_minutes: 60
-hf_upload_interval_minutes: 60     # push checkpoint + graphs to HF every hour
-checkpoint_dir: checkpoints/vqa
-out_dir: outs/vqa
+checkpoint_interval_minutes: 60     # save locally every N min; with --hf also upload on each save
+checkpoint_dir: /kaggle/temp/medicalvllm/checkpoints/vqa
+out_dir: /kaggle/temp/medicalvllm/outs/vqa
 # --hf enables BOTH download (medical_vllm/phase2/phase_2_latest.pt) and upload.
 # --no-hf, or omitting --hf, disables both. CLI always overrides `enabled`.
 hf:
   enabled: false
   repo: AsishKumarDalal/medicalvllm   # same repo; phase2/ folder
   root: medical_vllm
+# With --qwen + --hf: <repo>/medical_vllm/qwen/sft/
+# (align uses <repo>/medical_vllm/qwen/align/).
+hf_qwen:
+  root: medical_vllm/qwen
+  phase_names: {1: align, 2: sft}
+  # repo: sddfhy546y/minillm

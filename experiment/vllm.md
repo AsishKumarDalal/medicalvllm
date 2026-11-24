@@ -20,6 +20,12 @@ written against the **actual** minillm code (`../minillm/model/model.py`,
 `configs/model.yaml`), not the older 128-context draft in
 `minillm/experiments/plan/vision_model.md`.
 
+> **Alternative LLM backend.** Both trainers accept `--qwen`, which replaces
+> the GPT-2 decoder with `Qwen/Qwen3-0.6B` (`model/qwen_llm.py`). The vision
+> tower and the soft-prefix idea are unchanged; the LLM wrapper, tokenizer,
+> EOT/pad ids and connector input width (768→1024) become backend-dependent.
+> Everything below describes the default GPT-2 path unless noted otherwise.
+
 ---
 
 ## 1. Starting assets

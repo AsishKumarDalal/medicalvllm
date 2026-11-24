@@ -50,6 +50,13 @@ HF, `--new` = random LLM weights / global step 0. Nothing is uploaded unless
 Phase 1's step, token count, image count and optimizer state. See the
 [runbook](runbook/README.md) for the full layout.
 
+**Qwen option:** add `--qwen` to both trainers to replace the GPT-2 decoder with
+`Qwen/Qwen3-0.6B`. This also swaps the tokenizer (HF Qwen2Tokenizer), the EOT
+and pad ids, and adds a 768→1024 input projection to the connector. GPT-2 SFT
+weights are ignored in that mode; a pretrained Qwen decoder is used instead.
+Checkpoints record the backend, so eval/sampling decode with the right
+tokenizer. See [`train/README.md`](train/README.md#qwen3-backend---qwen).
+
 The SFT checkpoint is resolved from `configs/align.yaml`: local path first,
 then `hf_fallback` (`sddfhy546y/minillm:sft_model.pt`). The 86M vision tower is
 never saved in checkpoints — it is rebuilt from its name at load time.

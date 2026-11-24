@@ -39,6 +39,56 @@ def resolve_path(path: str, base: Path) -> Path:
     return p if p.is_absolute() else (base / p)
 
 
+# --------------------------------------------------------------- LLM backends
+QWEN_MODEL = "Qwen/Qwen3-0.6B"
+
+
+def checkpoint_llm_backend(path) -> str | None:
+    """LLM backend recorded in a checkpoint, or ``None`` if unknown.
+
+    Plain minillm SFT checkpoints predate the backend field and are GPT-2.
+    """
+    if not path or not Path(path).is_file():
+        return None
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        return None
+    llm_cfg = (state.get("config") or {}).get("llm") or {}
+    if not llm_cfg and state.get("model_config"):
+        llm_cfg = state["model_config"]
+    return str(llm_cfg.get("backend", "gpt2")).lower()
+
+
+def make_qwen_llm_config(
+    model_name: str = QWEN_MODEL,
+    context_length: int = 1024,
+    dtype: str = "float32",
+    gradient_checkpointing: bool = False,
+) -> dict:
+    """Config dict for a fresh Qwen run (token ids are added later)."""
+    return {
+        "backend": "qwen",
+        "model_name": str(model_name),
+        "context_length": int(context_length),
+        "dtype": str(dtype),
+        "gradient_checkpointing": bool(gradient_checkpointing),
+    }
+
+
+def finalize_llm_config(llm_cfg: dict) -> dict:
+    """Attach backend-specific token ids from the active tokenizer."""
+    from data.tokenizer import get_eot_id, get_pad_id
+
+    llm_cfg = dict(llm_cfg)
+    backend = str(llm_cfg.get("backend", "gpt2")).lower()
+    llm_cfg["backend"] = backend
+    if backend == "qwen":
+        llm_cfg["eot_token_id"] = get_eot_id()
+        llm_cfg["pad_token_id"] = get_pad_id()
+    return llm_cfg
+
+
 # -------------------------------------------------------------------- seeding
 def set_seed(seed: int = 0):
     random.seed(seed)
@@ -81,7 +131,25 @@ def select_devices(name: str = "auto", num_gpus: int = 2):
             idx = 0
         return torch.device(f"cuda:{idx}"), [idx]
     n = max(1, min(int(num_gpus), torch.cuda.device_count()))
-    return torch.device("cuda:0"), list(range(n))
+    ids = list(range(n))
+    # Skip a GPU that another process has already filled; otherwise
+    # DataParallel would still try to place a replica there and OOM.
+    usable = []
+    for i in ids:
+        try:
+            free, _ = torch.cuda.mem_get_info(i)
+            if free < 3 * 1024 ** 3:  # less than 3 GiB free
+                logger.warning(
+                    "GPU %d has only %.1f GiB free; skipping it", i, free / 1e9
+                )
+                continue
+        except Exception:
+            pass
+        usable.append(i)
+    if not usable:
+        logger.warning("no GPU has >=3 GiB free; falling back to GPU 0")
+        usable = [0]
+    return torch.device(f"cuda:{usable[0]}"), usable
 
 
 def unwrap_model(model):
@@ -161,11 +229,61 @@ def move_batch(batch: dict, device: torch.device) -> dict:
     return out
 
 
+def build_optimizer(param_groups, kind: str = "adamw", weight_decay: float = 0.01):
+    """Create the optimizer for the given parameter groups.
+
+    ``adafactor`` is the Stage 2 default for full Qwen fine-tuning: it keeps
+    fp32 weights and gradients (so no fp16 NaN / update underflow) but stores
+    only row/column variance estimates instead of AdamW's two full moment
+    tensors, saving ~4.8 GB per GPU for a 0.6B model.
+    """
+    kind = str(kind or "adamw").lower()
+    if kind in {"adafactor", "ada"}:
+        return torch.optim.Adafactor(
+            param_groups,
+            lr=0.01,                 # each group carries its own lr
+            # Adafactor squares eps1 internally. 1e-30 becomes 1e-60, which
+            # underflows to 0 in fp32; rsqrt(0)=inf and inf*0grad=NaN for any
+            # zero-gradient row. 1e-7 is representable and matches finfo.eps.
+            eps=(1e-7, 1e-3),
+            weight_decay=weight_decay,
+        )
+    if kind in {"adamw", "adam"}:
+        return torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+    raise ValueError(f"unknown optimizer: {kind!r} (use adamw or adafactor)")
+
+
 def clip_grad_norm(model, max_norm: float) -> float:
     params = [p for p in model.parameters() if p.requires_grad and p.grad is not None]
     if not params:
         return 0.0
     return torch.nn.utils.clip_grad_norm_(params, max_norm).item()
+
+
+def nonfinite_parameter_names(model) -> list[str]:
+    """Names of floating-point parameters that contain NaN or Inf."""
+    bad = []
+    for name, p in model.named_parameters():
+        if p.is_floating_point() and not bool(torch.isfinite(p).all()):
+            bad.append(name)
+    return bad
+
+
+def assert_finite_parameters(model, source: str = "model") -> None:
+    """Fail fast instead of training/saving weights that are already NaN.
+
+    One fp16 AdamW step with the default ``eps=1e-8`` turns every weight into
+    NaN: ``eps`` underflows to 0 in fp16, small squared grads flush to 0, and
+    AdamW divides 0/0. Resuming such a checkpoint makes every loss NaN, and
+    the final save would overwrite the last good checkpoint with garbage.
+    """
+    bad = nonfinite_parameter_names(model)
+    if bad:
+        raise RuntimeError(
+            f"{source} contains {len(bad)} non-finite parameter tensor(s), "
+            f"e.g. {', '.join(bad[:3])}. Refusing to train. Restore a clean "
+            "checkpoint (or rerun with --new)."
+        )
 
 
 # ------------------------------------------------------------- run state
@@ -251,6 +369,27 @@ def load_optimizer_state_named(model, optimizer, saved: dict | None) -> int:
     """Restore matching parameters. Returns how many params were restored."""
     if not saved:
         return 0
+    saved_name = saved.get("optimizer_name")
+    current_name = type(optimizer).__name__
+    if saved_name and saved_name != current_name:
+        logger.warning(
+            "checkpoint optimizer is %s but this run uses %s; starting "
+            "optimizer state fresh (model weights are still restored)",
+            saved_name, current_name,
+        )
+        return 0
+    probe = next(iter((saved.get("state") or {}).values()), None)
+    expected = {
+        "AdamW": {"exp_avg", "exp_avg_sq"},
+        "Adafactor": {"row_var", "col_var", "variance"},
+    }.get(current_name)
+    if probe and expected and not (set(probe) & expected):
+        logger.warning(
+            "checkpoint optimizer state is incompatible with %s; starting "
+            "optimizer state fresh (model weights are still restored)",
+            current_name,
+        )
+        return 0
     name_to_param = dict(model.named_parameters())
     id_to_name = {id(p): n for n, p in name_to_param.items()}
     restored = 0
@@ -260,7 +399,16 @@ def load_optimizer_state_named(model, optimizer, saved: dict | None) -> int:
             continue
         entry = {}
         for k, v in s.items():
-            entry[k] = v.to(p.device).clone() if torch.is_tensor(v) else v
+            if torch.is_tensor(v):
+                # Moment tensors follow the parameter dtype, but Adam's `step`
+                # is a scalar counter: casting it to fp16 loses exact integers
+                # above 2048. Keep scalar/int tensors in their saved dtype.
+                if v.dim() > 0 and v.is_floating_point():
+                    entry[k] = v.to(p.device, dtype=p.dtype).clone()
+                else:
+                    entry[k] = v.to(p.device).clone()
+            else:
+                entry[k] = v
         optimizer.state[p] = entry
         restored += 1
 
@@ -320,6 +468,7 @@ def build_checkpoint(
         "llm": model.llm.state_dict(),
         "connector": model.connector.state_dict(),
         "optimizer": optimizer_state_named(model, optimizer),
+        "optimizer_name": type(optimizer).__name__,
         "scheduler": scheduler.state_dict(),
         "vision": {
             "encoder": model.vision.encoder_name,
@@ -509,6 +658,9 @@ def setup_logging() -> None:
     # Xet opens background Rust threads for parquet range requests; at process
     # exit those threads hit closed file descriptors and retry for ~30 s.
     os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+    # Fewer CUDA allocator fragments when the logits tensor (~594 MB) is freed
+    # and reallocated every step. Must be set before CUDA is first used.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     # DataParallel gathers our scalar loss into a vector; we reduce it with
     # .mean() before backward, so this torch warning is expected noise.
     warnings.filterwarnings(
@@ -642,7 +794,7 @@ def progress_update(
         pbar.update(1)
 
 
-def show_sample_image(pixel, out_dir, step: int):
+def show_sample_image(pixel, out_dir, step: int, caption: str | None = None):
     """Un-normalize a sample tensor, save it and display it in a notebook."""
     from PIL import Image as PILImage
 
@@ -659,13 +811,66 @@ def show_sample_image(pixel, out_dir, step: int):
     sample_dir = Path(out_dir) / "samples"
     sample_dir.mkdir(parents=True, exist_ok=True)
     path = sample_dir / f"sample_step{step:07d}.png"
-    PILImage.fromarray(arr).save(path)
+    latest = Path(out_dir) / "sample_latest.png"
 
-    try:  # Kaggle / Jupyter: actually show the image
-        from IPython.display import display
-        display(PILImage.open(path))
-    except Exception:
-        pass
+    # Render exactly like the loss/LR graphs: one PNG with the image on top and
+    # the full PROMPT / GENERATED / REFERENCE text underneath. Also write a
+    # stable `sample_latest.png` beside the graphs so a notebook cell can show
+    # the newest sample with the same two lines used for loss_vs_step.png.
+    try:
+        import textwrap
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        # Wrap each PROMPT/GENERATED/REFERENCE paragraph separately so the
+        # field boundaries stay visible, then grow the text panel with the
+        # line count — 200 tokens per field no longer overflow the figure.
+        wrapped_lines: list[str] = []
+        for para in (caption or "").splitlines():
+            if not para.strip():
+                wrapped_lines.append("")
+            else:
+                wrapped_lines.extend(
+                    textwrap.wrap(
+                        para, width=100,
+                        replace_whitespace=False, drop_whitespace=False,
+                    ) or [""]
+                )
+        wrapped = "\n".join(wrapped_lines)
+        text_in = max(2.2, 0.145 * len(wrapped_lines) + 0.5)
+
+        fig = plt.figure(figsize=(8, 5.0 + text_in))
+        grid = fig.add_gridspec(2, 1, height_ratios=[5, text_in], hspace=0.08)
+        ax_img = fig.add_subplot(grid[0])
+        ax_img.imshow(arr)
+        ax_img.axis("off")
+        ax_img.set_title(f"sample @ step {step:,}", fontsize=11)
+        ax_txt = fig.add_subplot(grid[1])
+        ax_txt.axis("off")
+        ax_txt.text(
+            0.01, 0.98, wrapped, va="top", ha="left",
+            fontsize=8, family="monospace", color="#222222",
+        )
+        fig.subplots_adjust(left=0.03, right=0.97, top=0.95, bottom=0.03)
+        fig.savefig(path, dpi=120)
+        fig.savefig(latest, dpi=120)
+        plt.close(fig)
+    except Exception as exc:
+        logger.debug("matplotlib sample render failed (%s): %s",
+                     type(exc).__name__, exc)
+        PILImage.fromarray(arr).save(path)
+        PILImage.fromarray(arr).save(latest)
+
+    try:
+        from train.notebook import display_image
+
+        display_image(path, caption or f"sample @ step {step}")
+    except Exception as exc:
+        logger.debug("could not display sample inline (%s): %s",
+                     type(exc).__name__, exc)
     return path
 
 
@@ -677,18 +882,24 @@ def log_sample_generation(
     step: int,
     pbar=None,
     out_dir: str | Path | None = None,
-    max_new_tokens: int = 32,
+    max_new_tokens: int = 200,
+    max_text_tokens: int = 200,
     temperature: float = 0.0,
     top_k: int | None = None,
-    eos_id: int = 50256,
+    eos_id: int | None = None,
 ):
     """Generate from ONE held-out dataset image and print the result.
 
     Used every ``sample_interval`` steps so you can *see* what the model
-    learned, not just watch the loss. Mirrors minillm's ``_log_sample``.
+    learned, not just watch the loss. PROMPT/GENERATED/REFERENCE are decoded
+    from at most ``max_text_tokens`` tokens each (default 200), so a long
+    instruction is no longer cut at 220 characters. Mirrors minillm's
+    ``_log_sample``.
     """
-    from data.tokenizer import EOT_TOKEN_ID, get_encoder
+    from data.tokenizer import get_eot_id, get_encoder
 
+    if eos_id is None:
+        eos_id = get_eot_id()
     enc = get_encoder()
     try:
         ex = next(sample_iter)
@@ -715,12 +926,19 @@ def log_sample_generation(
             top_k=top_k,
             eos_id=eos_id,
         )
-        prompt = enc.decode(prompt_ids)
-        generated = enc.decode(out[0, ids.size(1):].tolist())
+        # Cap each field by TOKENS, not characters. 200 tokens covers the full
+        # instruction+question prompt; generated text is already bounded by
+        # max_new_tokens. Decoding the first N ids also avoids cutting a
+        # multi-byte token in half.
+        def _decode(ids):
+            return enc.decode(list(ids)[:max_text_tokens])
+
+        prompt = _decode(prompt_ids)
+        generated = _decode(out[0, ids.size(1):].tolist())
         ref_ids = [
-            t for t in ex["labels"] if t != -100 and t != EOT_TOKEN_ID
+            t for t in ex["labels"] if t != -100 and t != eos_id
         ]
-        ref = enc.decode(ref_ids)
+        ref = _decode(ref_ids)
     except Exception as exc:
         logger.warning("sample generation failed at step %d (%s): %s",
                        step, type(exc).__name__, exc)
@@ -728,21 +946,24 @@ def log_sample_generation(
     finally:
         model.train(was_training)
 
+    parts = [
+        f"sample @ step {step:,}",
+        f"PROMPT: {' '.join(prompt.split())}",
+        f"GENERATED: {' '.join(generated.split())}",
+        f"REFERENCE: {' '.join(ref.split())}",
+    ]
+    # One field per paragraph in the PNG (readable at 200 tokens each); the
+    # log line stays single-line so it does not break the tqdm bar.
+    caption = "\n".join(parts)
     image_path = None
     if out_dir is not None and pixel is not None:
         try:
-            image_path = show_sample_image(pixel, out_dir, step)
+            image_path = show_sample_image(pixel, out_dir, step, caption=caption)
         except Exception as exc:
             logger.warning("could not show sample image (%s): %s",
                            type(exc).__name__, exc)
 
-    msg = (
-        f"sample @ step {step:,} | "
-        f"IMAGE: {image_path} | "
-        f"PROMPT: {' '.join(prompt.split())[:220]} | "
-        f"GENERATED: {' '.join(generated.split())[:220]} | "
-        f"REFERENCE: {' '.join(ref.split())[:120]}"
-    )
+    msg = f"{parts[0]} | IMAGE: {image_path} | " + " | ".join(parts[1:])
     if pbar is not None:
         pbar.write(msg)
     else:

@@ -26,8 +26,10 @@ only** (YAML `hours` / `steps` are stop limits, not bar modes):
 - neither — e.g. `--no-hf` alone → dataset rows consumed / `data.epoch_size`
   (description: `phaseN (rows)`, wraps once per epoch)
 
-With `--hf`, the latest checkpoint and all `outs/` graphs are pushed to HF
-every `hf_upload_interval_minutes` (default 60) and once at the end.
+Checkpoints are saved locally every `checkpoint_interval_minutes` (default 60,
+or `--save N`). With `--hf`, each save also pushes the latest
+checkpoint and all `outs/` graphs to HF; with `--no-hf` the same timer only
+saves locally. A final save (and upload, if enabled) happens on stop.
 
 **Multi-GPU:** `num_gpus: 2` in each config (or `--num-gpus N`) wraps the model
 in `nn.DataParallel` when several GPUs are visible. Optimizer state, sampling,

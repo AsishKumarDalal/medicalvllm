@@ -11,6 +11,7 @@ Run:
 - `python code_test/test_med_data_tiny.py`
 - `python code_test/test_train_tiny.py`
 - `python code_test/test_checkpoint_tiny.py`
+- `python -m code_test.test_qwen_tiny`
 
 Never read, print, or commit `.env`; keep `HF_TOKEN` in env/Kaggle Secrets.
 Update READMEs/runbook when behavior or config changes. Commit and push only

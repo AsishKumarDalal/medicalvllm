@@ -22,9 +22,9 @@ import torch
 
 from data.collate import collate_fn
 from data.medical_vqa import VQAStream, SOURCES
-from data.tokenizer import EOT_TOKEN_ID, get_encoder
+from data.tokenizer import get_encoder, set_tokenizer_backend
 from model.medical_vllm import MedicalVLLM
-from train.common import get_device, resolve_path, set_seed
+from train.common import QWEN_MODEL, get_device, resolve_path, set_seed
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,7 +66,7 @@ def _generate(
     for _ in range(max_new_tokens):
         nxt = model.llm._sample_next(logits, 0.0, None)
         nxt, finished, all_done = model.llm._apply_eos(
-            nxt, finished, EOT_TOKEN_ID
+            nxt, finished, model.eot_id
         )
         generated = torch.cat([generated, nxt], dim=1)
         if all_done:
@@ -115,7 +115,7 @@ def evaluate(
         gen = _generate(model, prefix, ids, max_new_tokens)
         pred = enc.decode(gen[0, ids.size(1):].tolist()).strip()
         ref_ids = [
-            t for t in ex["labels"] if t != -100 and t != EOT_TOKEN_ID
+            t for t in ex["labels"] if t != -100 and t != model.eot_id
         ]
         ref = enc.decode(ref_ids).strip()
         rows.append((pred, ref))
@@ -133,6 +133,12 @@ def main(argv=None):
     ap.add_argument("--device", default="auto")
     ap.add_argument("--out", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--qwen", action="store_true",
+                    help="force the Qwen tokenizer (auto-detected from checkpoint)")
+    ap.add_argument("--qwen-model", default=None,
+                    help=f"HuggingFace Qwen model id (default {QWEN_MODEL})")
+    ap.add_argument("--qween", dest="qwen", action="store_true",
+                    help=argparse.SUPPRESS)  # common misspelling
     args = ap.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO)
@@ -141,6 +147,13 @@ def main(argv=None):
     ckpt = Path(args.checkpoint)
     state = torch.load(ckpt, map_location="cpu", weights_only=True)
     cfg = state["config"]
+    llm_cfg = cfg.get("llm") or {}
+    saved_backend = str(llm_cfg.get("backend", "gpt2")).lower()
+    use_qwen = bool(args.qwen) or saved_backend == "qwen"
+    set_tokenizer_backend(
+        "qwen" if use_qwen else "gpt2",
+        model_name=args.qwen_model or llm_cfg.get("model_name", QWEN_MODEL),
+    )
 
     model = MedicalVLLM(
         cfg["llm"], cfg["vision"], cfg.get("connector") or cfg["vision"]

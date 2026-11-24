@@ -2,12 +2,14 @@
 
 import torch
 
-from .tokenizer import EOT_TOKEN_ID
+from .tokenizer import get_pad_id
 
 
-def collate_fn(batch: list[dict], pad_id: int = EOT_TOKEN_ID):
+def collate_fn(batch: list[dict], pad_id: int | None = None):
     if not batch:
         raise ValueError("empty batch")
+    if pad_id is None:
+        pad_id = get_pad_id()
     max_len = max(len(ex["input_ids"]) for ex in batch)
     ids, labels, pixels = [], [], []
     has_image = batch[0]["pixel_values"] is not None
